@@ -229,12 +229,14 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
     return data
 
 # ==========================================
-# 智能诊断引擎
+# 智能诊断引擎（完整版，包含 TP=20 诊断）
 # ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
     
-    # 进水COD异常
+    # ===== 进水异常诊断 =====
+    
+    # --- 进水COD异常 ---
     if inlet['COD'] > 500:
         diagnoses.append({
             'level': 'critical',
@@ -263,7 +265,69 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['减少碳源投加量20-30%', '适当降低曝气量', '检查污泥浓度防止膨胀']
         })
     
-    # 出水异常
+    # --- 进水NH3-N异常 ---
+    if inlet['NH3-N'] > 45:
+        diagnoses.append({
+            'level': 'critical',
+            'indicator': '进水NH₃-N',
+            'current': f"{inlet['NH3-N']:.1f} mg/L",
+            'title': '🚨 进水NH₃-N严重超标（>45 mg/L）',
+            'reasons': ['工业废水偷排高浓度氨氮废水', '污泥消化液回流', '上游硝化效果差'],
+            'actions': ['提高DO至3.5-4.0 mg/L', '补充碱度NaHCO₃ 80-100mg/L', '延长污泥龄至18-20天', '降低进水量20%']
+        })
+    elif inlet['NH3-N'] > 35:
+        diagnoses.append({
+            'level': 'warning',
+            'indicator': '进水NH₃-N',
+            'current': f"{inlet['NH3-N']:.1f} mg/L",
+            'title': '⚠️ 进水NH₃-N偏高（35-45 mg/L）',
+            'reasons': ['上游来水氨氮浓度升高', '硝化菌活性受抑制', '污泥龄不足'],
+            'actions': ['提高DO至3.0-3.5 mg/L', '补充碱度50-80 mg/L', '延长SRT至15天以上']
+        })
+    
+    # --- 进水TP异常（关键修复：TP=20 会触发此诊断） ---
+    if inlet['TP'] > 7.0:
+        diagnoses.append({
+            'level': 'critical',
+            'indicator': '进水TP',
+            'current': f"{inlet['TP']:.2f} mg/L",
+            'title': '🚨 进水TP严重超标（>7.0 mg/L）',
+            'reasons': [
+                '工业废水偷排：磷化工/电镀企业排放高浓度磷废水',
+                '含磷洗涤剂废水集中排放',
+                '污泥厌氧释磷：污泥处理段磷释放回流',
+                '农业面源污染：含磷农药/化肥随雨水入厂'
+            ],
+            'actions': [
+                '【立即执行】增加PAC投加量40-50%（确保混凝剂充足）',
+                '【1小时内】检查并调整PAC投加点至混合反应池入口最佳位置',
+                '【2小时内】检查混凝pH，控制在6.5-7.5最佳范围',
+                '【4小时内】增加排泥量，防止磷二次释放',
+                '【持续监测】每2小时监测出水TP变化（22小时后评估）'
+            ]
+        })
+    elif inlet['TP'] > 5.0:
+        diagnoses.append({
+            'level': 'warning',
+            'indicator': '进水TP',
+            'current': f"{inlet['TP']:.2f} mg/L",
+            'title': '⚠️ 进水TP偏高（5.0-7.0 mg/L）',
+            'reasons': ['上游含磷废水浓度波动', 'PAC投加量相对不足', '混凝pH不适宜'],
+            'actions': ['增加PAC投加量20-30%', '检查pH并调节至最佳范围', '检查PAC投加点位置']
+        })
+    
+    # --- 进水SS异常 ---
+    if inlet['SS'] > 350:
+        diagnoses.append({
+            'level': 'warning',
+            'indicator': '进水SS',
+            'current': f"{inlet['SS']:.0f} mg/L",
+            'title': '⚠️ 进水SS严重偏高（>350 mg/L）',
+            'reasons': ['管网冲刷：施工或雨期携带大量泥沙', '上游管网沉积物释放', '初沉池运行异常'],
+            'actions': ['增加初沉池排泥频率', '投加PAM絮凝剂改善沉淀效果', '监测二沉池泥位']
+        })
+    
+    # ===== 出水超标诊断 =====
     if outlet['COD'] > DESIGN_LIMITS['COD']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['COD'] > 45 else 'warning',

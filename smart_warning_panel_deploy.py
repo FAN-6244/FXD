@@ -1,17 +1,22 @@
 """
 smart_warning_panel_deploy.py
-部署到 Streamlit Cloud 的版本 —— 直接加载预训练模型，不重新训练
+部署到 Streamlit Cloud 的版本 —— 加载预训练模型 + 确定性特征生成 + 北京时间
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
+
+# ==========================================
+# 北京时间时区
+# ==========================================
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 st.set_page_config(
     page_title="水质净化厂智能预警与调控决策系统",
@@ -133,7 +138,7 @@ MEMORY = {
 }
 
 # ==========================================
-# 加载预训练模型（关键：不重新训练）
+# 加载预训练模型
 # ==========================================
 @st.cache_resource
 def load_models():
@@ -155,16 +160,17 @@ models, feature_cols, scaler = load_models()
 st.markdown('<div class="main-title">🏭 水质净化厂智能预警与调控决策系统</div>', unsafe_allow_html=True)
 
 # ==========================================
-# 状态栏
+# 状态栏（显示北京时间）
 # ==========================================
 col_s1, col_s2, col_s3 = st.columns(3)
 status_placeholder = col_s1.empty()
 
 with col_s2:
+    beijing_now = datetime.now(BEIJING_TZ)
     st.markdown(f"""
     <div class="status-metric">
         <div class="label">⏱️ 当前时间</div>
-        <div class="value">{datetime.now().strftime('%H:%M')}</div>
+        <div class="value">{beijing_now.strftime('%H:%M')}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -189,7 +195,14 @@ def predict_one(input_data, target, models, feature_cols, scaler):
     except Exception:
         return None
 
-def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do, trend_factor=1.0):
+# ==========================================
+# 确定性滞后特征生成（修复：去掉随机噪声）
+# ==========================================
+def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
+    """
+    构建含滞后特征的输入数据
+    修复：去掉随机噪声，使用确定性衰减，保证相同输入产生相同预测
+    """
     data = pd.DataFrame({
         'COD_load': [cod * flow / 1000],
         'NH3_load': [nh3 * flow / 1000],
@@ -200,18 +213,27 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do, trend_f
         'MLSS': [mlss],
         'DO': [do]
     })
+    
+    # 基于当前值生成滞后特征，使用确定性衰减（无随机噪声）
     for i in range(1, 49):
+        # 离当前越近的lag影响越大，越远的lag影响越小（衰减）
         decay = 1 - (i / 48) * 0.3
-        noise = 1 + np.random.normal(0, 0.03)
-        factor = trend_factor * decay * noise
+        # 根据当前输入值生成滞后特征（无随机噪声）
+        factor = decay
+        
         data[f'COD_load_lag{i}'] = cod * flow / 1000 * factor
         data[f'NH3_load_lag{i}'] = nh3 * flow / 1000 * factor
         data[f'TP_load_lag{i}'] = tp * flow / 1000 * factor
         data[f'流量_lag{i}'] = flow * factor
+    
     return data
 
+# ==========================================
+# 智能诊断引擎
+# ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
+    
     # 进水COD异常
     if inlet['COD'] > 500:
         diagnoses.append({
@@ -240,6 +262,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['雨水稀释', '上游截流或闸门关闭', '进水流量增大'],
             'actions': ['减少碳源投加量20-30%', '适当降低曝气量', '检查污泥浓度防止膨胀']
         })
+    
     # 出水异常
     if outlet['COD'] > DESIGN_LIMITS['COD']['value']:
         diagnoses.append({
@@ -250,6 +273,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'进水COD负荷过高（{inlet["COD"]:.0f} mg/L）', f'DO不足（{do:.1f}）', '污泥老化', '二沉池跑泥'],
             'actions': [f'增加碳源{int(carbon)}→{int(carbon*1.25)}', f'提高DO至2.5-3.0', '加大排泥20-30%', '检查二沉池']
         })
+    
     if outlet['NH3-N'] > DESIGN_LIMITS['NH3-N']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['NH3-N'] > 3.0 else 'warning',
@@ -259,6 +283,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'DO不足（{do:.1f}）', '碱度不足', 'SRT太短', '进水冲击'],
             'actions': ['提高DO至3.0-3.5', '补充NaHCO₃ 50-80mg/L', '延长SRT至15天以上', '降低进水量15%']
         })
+    
     if outlet['TP'] > DESIGN_LIMITS['TP']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['TP'] > 0.6 else 'warning',
@@ -268,6 +293,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'PAC不足（{pac:.0f} mg/L）', 'pH不适宜', '投加点不当', '磷释放'],
             'actions': [f'增加PAC {pac}→{int(pac*1.4)}', '调整投加点', '检查pH', '增加排泥']
         })
+    
     if outlet['SS'] > DESIGN_LIMITS['SS']['value']:
         diagnoses.append({
             'level': 'warning',
@@ -277,6 +303,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['表面负荷过高', 'SVI升高', '排泥不足'],
             'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })
+    
     return diagnoses
 
 # ==========================================
@@ -288,7 +315,6 @@ st.sidebar.caption("设计标准：COD≤30 | NH₃-N≤1.5 | TP≤0.3 | SS≤10
 cod_in = nh3_in = tp_in = ss_in = flow_in = 0
 pac = carbon = mlss = do = 0
 input_data = None
-trend_factor = 1.0
 
 st.sidebar.markdown("### 进水实测")
 c1, c2 = st.sidebar.columns(2)
@@ -309,11 +335,8 @@ with c4:
     mlss = st.number_input("MLSS (mg/L)", min_value=0.0, value=4000.0)
     do = st.number_input("DO (mg/L)", min_value=0.0, value=2.0)
 
-avg_load = (cod_in * flow_in + nh3_in * flow_in + tp_in * flow_in) / 3
-trend_factor = 1.0 + (avg_load - 10000) / 50000 * 0.3
-trend_factor = max(0.7, min(1.5, trend_factor))
-
-input_data = build_input_with_lags(cod_in, nh3_in, tp_in, ss_in, flow_in, pac, carbon, mlss, do, trend_factor)
+# 使用确定性方法生成滞后特征（无随机噪声）
+input_data = build_input_with_lags(cod_in, nh3_in, tp_in, ss_in, flow_in, pac, carbon, mlss, do)
 
 # ==========================================
 # 主界面
@@ -391,7 +414,7 @@ if input_data is not None:
 
     # ---- 趋势图 ----
     st.markdown('<div class="section-header">📈 进出水趋势（近24小时）</div>', unsafe_allow_html=True)
-    times = pd.date_range(end=datetime.now(), periods=24, freq='h')
+    times = pd.date_range(end=datetime.now(BEIJING_TZ), periods=24, freq='h')
     hist_in = {k: np.maximum(0, np.random.normal(v, v*0.12, 24)) for k, v in inlet.items()}
     hist_out = {k: np.maximum(0, np.random.normal(outlet[k], outlet[k]*0.08, 24)) for k in ['COD', 'NH3-N', 'TP', 'SS']}
     for k in ['COD', 'NH3-N', 'TP', 'SS']:
@@ -409,7 +432,7 @@ if input_data is not None:
     fig.add_trace(go.Scatter(x=times, y=hist_out['TP'], name='出水TP', line=dict(color='#F39C12', width=2)), row=3, col=1)
     fig.add_hline(y=DESIGN_LIMITS['TP']['value'], line_dash="dash", line_color="red", row=3, col=1)
     fig.update_layout(height=400, showlegend=True, hovermode='x unified')
-    fig.update_xaxes(title_text="时间", row=3, col=1)
+    fig.update_xaxes(title_text="时间（北京时间）", row=3, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
     # ---- 记忆长度 ----
@@ -499,4 +522,5 @@ else:
     st.info("👈 请左侧输入数据")
 
 st.markdown("---")
-st.caption(f"🏭 v5.1 | 出水标准：准Ⅳ类 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+beijing_now = datetime.now(BEIJING_TZ)
+st.caption(f"🏭 v5.2 | 出水标准：准Ⅳ类 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

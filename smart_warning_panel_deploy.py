@@ -1,6 +1,7 @@
 """
 smart_warning_panel_deploy.py
 部署到 Streamlit Cloud 的版本 —— 加载预训练模型 + 确定性特征生成 + 北京时间
+优化：加载提示用 st.empty() 替换，不再残留
 """
 
 import streamlit as st
@@ -138,11 +139,12 @@ MEMORY = {
 }
 
 # ==========================================
-# 加载预训练模型
+# 加载预训练模型（优化：用 st.empty() 替换提示）
 # ==========================================
 @st.cache_resource
 def load_models():
-    st.info("🔄 正在加载预训练模型...")
+    status_placeholder = st.empty()
+    status_placeholder.info("🔄 正在加载预训练模型...")
     try:
         with open('model_cache/models.pkl', 'rb') as f:
             models = pickle.load(f)
@@ -150,10 +152,10 @@ def load_models():
             scaler = pickle.load(f)
         with open('model_cache/feature_cols.pkl', 'rb') as f:
             feature_cols = pickle.load(f)
-        st.success("✅ 模型加载成功")
+        status_placeholder.success("✅ 模型加载成功")
         return models, feature_cols, scaler
     except FileNotFoundError as e:
-        st.error(f"❌ 模型文件不存在: {e}")
+        status_placeholder.error(f"❌ 模型文件不存在: {e}")
         st.stop()
 
 models, feature_cols, scaler = load_models()
@@ -342,7 +344,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })
     
-    # ===== 运行参数异常（新增：与本地一致） =====
+    # ===== 运行参数异常（与本地一致） =====
     if do < 0.8:
         diagnoses.append({
             'level': 'critical',
@@ -426,7 +428,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
 # ==========================================
 st.sidebar.markdown("## 📊 数据输入")
 
-# 三种输入模式（与本地完全一致）
 input_mode = st.sidebar.radio(
     "输入方式",
     ["✏️ 手动输入", "📁 文件上传", "📡 API接入"],
@@ -671,4 +672,4 @@ else:
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v5.2 | 出水标准：准Ⅳ类 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v5.3 | 出水标准：准Ⅳ类 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

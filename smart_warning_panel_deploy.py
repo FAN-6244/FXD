@@ -1,7 +1,7 @@
 """
 smart_warning_panel_deploy.py
 部署到 Streamlit Cloud —— 四种输入模式 + 永久记忆（Supabase）
-完整版 v6.0
+完整版 v6.1
 """
 
 import streamlit as st
@@ -90,10 +90,45 @@ st.markdown("""
         padding: 6px 10px;
         box-shadow: 0 1px 2px rgba(0,0,0,0.04);
         margin-bottom: 3px;
+        border-left: 4px solid #2E86AB;
     }
-    .metric-card .label { font-size: 12px; color: #666; font-weight: 500; }
-    .metric-card .value { font-size: 18px; font-weight: 700; color: #1a3a5c; }
-    .metric-card .sub { font-size: 11px; color: #999; }
+    .metric-card .label {
+        font-size: 12px;
+        color: #666;
+        font-weight: 500;
+    }
+    .metric-card .value {
+        font-size: 18px;
+        font-weight: 700;
+        color: #1a3a5c;
+    }
+    .metric-card .sub {
+        font-size: 11px;
+        color: #999;
+    }
+    /* 底部统计卡片（与 metric-card 风格一致） */
+    .stat-card {
+        background: white;
+        border-radius: 6px;
+        padding: 6px 10px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        margin-bottom: 3px;
+        border-left: 4px solid #2E86AB;
+    }
+    .stat-card .stat-label {
+        font-size: 12px;
+        color: #666;
+        font-weight: 500;
+    }
+    .stat-card .stat-value {
+        font-size: 18px;
+        font-weight: 700;
+        color: #1a3a5c;
+    }
+    .stat-card .stat-sub {
+        font-size: 11px;
+        color: #999;
+    }
     .limit-ref {
         font-size: 11px;
         color: #888;
@@ -1052,20 +1087,35 @@ if input_data is not None:
         st.success("✅ 系统运行正常，未检测到异常")
         st.info("📋 建议：保持当前运行参数，定期巡检设备。")
 
-    # ---- 永久记忆统计 ----
+    # ---- 永久记忆统计（样式与 metric-card 一致） ----
     st.markdown("---")
     col_stats1, col_stats2, col_stats3 = st.columns(3)
     saved_count = get_saved_count()
     with col_stats1:
-        st.metric("📦 已永久保存数据", f"{saved_count} 组")
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-label">📦 已永久保存数据</div>
+            <div class="stat-value">{saved_count} 组</div>
+        </div>
+        """, unsafe_allow_html=True)
     with col_stats2:
-        st.metric("🔄 模型微调次数", f"{st.session_state.calibration_count} 次")
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-label">🔄 模型微调次数</div>
+            <div class="stat-value">{st.session_state.calibration_count} 次</div>
+        </div>
+        """, unsafe_allow_html=True)
     with col_stats3:
-        st.metric("🧠 记忆长度共识", "COD 8h · NH₃-N 6h · TP 22h")
+        st.markdown("""
+        <div class="stat-card">
+            <div class="stat-label">🧠 记忆长度共识</div>
+            <div class="stat-value">COD 8h · NH₃-N 6h · TP 22h</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 else:
     st.info("👈 请左侧输入数据")
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v6.0 | 四种输入模式 | 永久记忆已启用 | {beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v6.1 | 四种输入模式 | 永久记忆已启用 | {beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

@@ -34,7 +34,7 @@ st.set_page_config(
 # Supabase 配置
 # ==========================================
 SUPABASE_URL = "https://esoulexcrpdeeoumoili.supabase.co"
-SUPABASE_KEY = "sb_publishable_m0hz9Rv8NB_ziC5xKCltMg_Ij50d..."
+SUPABASE_KEY = "sb_publishable_m0hz9Rv8NB_ziC5xKCltMg_Ij5Od60Q"
 
 supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 

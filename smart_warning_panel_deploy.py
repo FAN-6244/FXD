@@ -1,6 +1,7 @@
 """
 smart_warning_panel_deploy.py
-部署到 Streamlit Cloud 的版本 —— 与本地版本完全一致
+部署到 Streamlit Cloud 的版本 —— 加载预训练模型 + 确定性特征生成 + 北京时间
+NH3-N 使用优化后的对数变换模型
 """
 
 import streamlit as st
@@ -138,26 +139,36 @@ MEMORY = {
 }
 
 # ==========================================
-# 加载预训练模型
+# 加载预训练模型（优化版：NH3-N 使用对数变换模型）
 # ==========================================
 @st.cache_resource
 def load_models():
     status_placeholder = st.empty()
     status_placeholder.info("🔄 正在加载预训练模型...")
     try:
+        # 加载通用模型（COD, TP）
         with open('model_cache/models.pkl', 'rb') as f:
             models = pickle.load(f)
+        # 加载 NH3-N 优化模型（对数变换）
+        with open('model_cache/nh3_optimized_model.pkl', 'rb') as f:
+            nh3_model = pickle.load(f)
+        with open('model_cache/nh3_optimized_scaler.pkl', 'rb') as f:
+            nh3_scaler = pickle.load(f)
+        with open('model_cache/nh3_optimized_feature_cols.pkl', 'rb') as f:
+            nh3_feature_cols = pickle.load(f)
+        # 加载通用 scaler 和 feature_cols（用于 COD, TP）
         with open('model_cache/scaler.pkl', 'rb') as f:
             scaler = pickle.load(f)
         with open('model_cache/feature_cols.pkl', 'rb') as f:
             feature_cols = pickle.load(f)
-        status_placeholder.success("✅ 模型加载成功")
-        return models, feature_cols, scaler
+        
+        status_placeholder.success("✅ 模型加载成功（NH3-N 使用优化对数模型）")
+        return models, feature_cols, scaler, nh3_model, nh3_scaler, nh3_feature_cols
     except FileNotFoundError as e:
         status_placeholder.error(f"❌ 模型文件不存在: {e}")
         st.stop()
 
-models, feature_cols, scaler = load_models()
+models, feature_cols, scaler, nh3_model, nh3_scaler, nh3_feature_cols = load_models()
 st.markdown('<div class="main-title">🏭 水质净化厂智能预警与调控决策系统</div>', unsafe_allow_html=True)
 
 # ==========================================
@@ -186,13 +197,28 @@ with col_s3:
 # ==========================================
 # 预测函数
 # ==========================================
-def predict_one(input_data, target, models, feature_cols, scaler):
+def predict_cod_tp(input_data, target, models, feature_cols, scaler):
     if input_data is None:
         return None
     try:
         vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in feature_cols]).reshape(1, -1)
         vec_scaled = scaler.transform(vec)
         return max(0, models[target].predict(vec_scaled)[0])
+    except Exception:
+        return None
+
+def predict_nh3_optimized(input_data, nh3_model, nh3_scaler, nh3_feature_cols):
+    """使用优化后的对数变换模型预测 NH3-N"""
+    if input_data is None:
+        return None
+    try:
+        vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in nh3_feature_cols]).reshape(1, -1)
+        vec_scaled = nh3_scaler.transform(vec)
+        # 预测对数变换后的值
+        pred_log = nh3_model.predict(vec_scaled)[0]
+        # 反向变换 expm1
+        pred = np.expm1(pred_log)
+        return max(0, pred)
     except Exception:
         return None
 
@@ -220,31 +246,20 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
     return data
 
 # ==========================================
-# 智能诊断引擎（与本地版本完全一致）
+# 智能诊断引擎（完整版）
 # ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
     
-    # 1. 进水COD异常
+    # 进水COD异常
     if inlet['COD'] > 500:
         diagnoses.append({
             'level': 'critical',
             'indicator': '进水COD',
             'current': f"{inlet['COD']:.0f} mg/L",
             'title': '🚨 进水COD严重超标（>500 mg/L）',
-            'reasons': [
-                '工业废水偷排：周边工业企业违规排放高浓度有机废水',
-                '管网沉积物冲刷：雨季或管网冲洗导致沉积有机物集中入厂',
-                '污泥厌氧消化液回流：消化液含高浓度COD回流至进水端',
-                '上游水质净化厂事故排放：民治/坂雪岗厂事故排放冲击'
-            ],
-            'actions': [
-                '【立即执行】增加碳源投加量30-40%，维持系统碳氮平衡',
-                '【立即执行】提高好氧段DO至3.0-3.5 mg/L，强化有机物降解',
-                '【1小时内】降低进水量15-20%，延长水力停留时间',
-                '【2小时内】联系上游泵站排查异常来水来源',
-                '【持续监测】每2小时取样监测进水COD变化趋势'
-            ]
+            'reasons': ['工业废水偷排高浓度有机废水', '管网沉积物冲刷', '污泥厌氧消化液回流', '上游事故排放'],
+            'actions': ['增加碳源投加量30-40%', '提高好氧段DO至3.0-3.5 mg/L', '降低进水量15-20%', '联系上游排查来水']
         })
     elif inlet['COD'] > 400:
         diagnoses.append({
@@ -252,17 +267,8 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '进水COD',
             'current': f"{inlet['COD']:.0f} mg/L",
             'title': '⚠️ 进水COD偏高（400-500 mg/L）',
-            'reasons': [
-                '工业废水间歇性排放冲击',
-                '管网沉积物受扰动释放',
-                '上游污水厂预处理效果波动'
-            ],
-            'actions': [
-                '增加碳源投加量20%',
-                '提高DO至2.5-3.0 mg/L',
-                '密切监测出水COD趋势（8小时后评估）',
-                '加强进水在线监测数据审核'
-            ]
+            'reasons': ['工业废水间歇性排放冲击', '管网沉积物释放', '上游处理效果波动'],
+            'actions': ['增加碳源投加量20%', '提高DO至2.5-3.0 mg/L', '密切监测出水COD趋势']
         })
     elif inlet['COD'] < 100 and inlet['COD'] > 0:
         diagnoses.append({
@@ -270,39 +276,19 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '进水COD',
             'current': f"{inlet['COD']:.0f} mg/L",
             'title': 'ℹ️ 进水COD偏低（<100 mg/L）',
-            'reasons': [
-                '雨水稀释：雨季或暴雨导致管网来水COD被稀释',
-                '上游截流：上游闸门关闭或来水减少',
-                '进水流量突然增大：清水混入'
-            ],
-            'actions': [
-                '减少碳源投加量20-30%',
-                '适当降低曝气量，节约能耗',
-                '检查污泥浓度，防止污泥膨胀',
-                '关注进水流量变化趋势'
-            ]
+            'reasons': ['雨水稀释', '上游截流', '进水流量增大'],
+            'actions': ['减少碳源投加量20-30%', '适当降低曝气量', '检查污泥浓度防止膨胀']
         })
     
-    # 2. 进水NH3-N异常
+    # 进水NH3-N异常
     if inlet['NH3-N'] > 45:
         diagnoses.append({
             'level': 'critical',
             'indicator': '进水NH₃-N',
             'current': f"{inlet['NH3-N']:.1f} mg/L",
             'title': '🚨 进水NH₃-N严重超标（>45 mg/L）',
-            'reasons': [
-                '工业废水偷排：化工/制药企业排放高浓度氨氮废水',
-                '污泥消化液回流：厌氧消化液含高浓度氨氮',
-                '上游污水厂硝化效果差：氨氮未能有效去除',
-                '管网中蛋白质类有机物分解产生氨氮'
-            ],
-            'actions': [
-                '【立即执行】提高好氧段DO至3.5-4.0 mg/L，强化硝化反应',
-                '【立即执行】补充碱度，投加NaHCO₃ 80-100 mg/L维持pH 7.2-7.8',
-                '【2小时内】延长污泥龄至18-20天，保证硝化菌生长',
-                '【4小时内】降低进水量20%，降低硝化负荷',
-                '【持续监测】每1小时监测出水NH₃-N变化'
-            ]
+            'reasons': ['工业废水偷排高浓度氨氮废水', '污泥消化液回流', '上游硝化效果差'],
+            'actions': ['提高DO至3.5-4.0 mg/L', '补充碱度NaHCO₃ 80-100mg/L', '延长污泥龄至18-20天']
         })
     elif inlet['NH3-N'] > 35:
         diagnoses.append({
@@ -310,39 +296,19 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '进水NH₃-N',
             'current': f"{inlet['NH3-N']:.1f} mg/L",
             'title': '⚠️ 进水NH₃-N偏高（35-45 mg/L）',
-            'reasons': [
-                '上游来水氨氮浓度升高',
-                '硝化菌活性受抑制（温度/DO/碱度不足）',
-                '污泥龄不足导致硝化菌流失'
-            ],
-            'actions': [
-                '提高DO至3.0-3.5 mg/L',
-                '补充碱度50-80 mg/L',
-                '检查SRT，建议延长至15天以上',
-                '6小时后评估硝化效果'
-            ]
+            'reasons': ['上游氨氮浓度升高', '硝化菌活性受抑制', '污泥龄不足'],
+            'actions': ['提高DO至3.0-3.5 mg/L', '补充碱度50-80 mg/L', '延长SRT至15天以上']
         })
     
-    # 3. 进水TP异常
+    # 进水TP异常
     if inlet['TP'] > 7.0:
         diagnoses.append({
             'level': 'critical',
             'indicator': '进水TP',
             'current': f"{inlet['TP']:.2f} mg/L",
             'title': '🚨 进水TP严重超标（>7.0 mg/L）',
-            'reasons': [
-                '工业废水偷排：磷化工/电镀企业排放高浓度磷废水',
-                '含磷洗涤剂废水集中排放',
-                '污泥厌氧释磷：污泥处理段磷释放回流',
-                '农业面源污染：含磷农药/化肥随雨水入厂'
-            ],
-            'actions': [
-                '【立即执行】增加PAC投加量40-50%（确保混凝剂充足）',
-                '【1小时内】检查并调整PAC投加点至混合反应池入口最佳位置',
-                '【2小时内】检查混凝pH，控制在6.5-7.5最佳范围',
-                '【4小时内】增加排泥量，防止磷二次释放',
-                '【持续监测】每2小时监测出水TP变化（22小时后评估）'
-            ]
+            'reasons': ['工业废水偷排高浓度磷废水', '含磷洗涤剂废水集中排放', '污泥厌氧释磷', '农业面源污染'],
+            'actions': ['增加PAC投加量40-50%', '调整PAC投加点至混合反应池入口', '检查pH 6.5-7.5', '增加排泥量']
         })
     elif inlet['TP'] > 5.0:
         diagnoses.append({
@@ -350,146 +316,74 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '进水TP',
             'current': f"{inlet['TP']:.2f} mg/L",
             'title': '⚠️ 进水TP偏高（5.0-7.0 mg/L）',
-            'reasons': [
-                '上游含磷废水浓度波动',
-                'PAC投加量相对不足',
-                '混凝pH不适宜'
-            ],
-            'actions': [
-                '增加PAC投加量20-30%',
-                '检查pH并调节至最佳范围',
-                '检查PAC投加点位置',
-                '22小时后评估除磷效果'
-            ]
+            'reasons': ['上游含磷废水浓度波动', 'PAC投加量相对不足', '混凝pH不适宜'],
+            'actions': ['增加PAC投加量20-30%', '检查pH并调节', '检查PAC投加点位置']
         })
     
-    # 4. 进水SS异常
+    # 进水SS异常
     if inlet['SS'] > 350:
         diagnoses.append({
             'level': 'warning',
             'indicator': '进水SS',
             'current': f"{inlet['SS']:.0f} mg/L",
             'title': '⚠️ 进水SS严重偏高（>350 mg/L）',
-            'reasons': [
-                '管网冲刷：施工或雨期携带大量泥沙',
-                '上游管网沉积物释放',
-                '初沉池运行异常'
-            ],
-            'actions': [
-                '增加初沉池排泥频率',
-                '投加PAM絮凝剂改善沉淀效果',
-                '监测二沉池泥位，防止跑泥'
-            ]
+            'reasons': ['管网冲刷', '上游管网沉积物释放', '初沉池运行异常'],
+            'actions': ['增加初沉池排泥频率', '投加PAM絮凝剂', '监测二沉池泥位']
         })
     
-    # 5. 出水COD超标
+    # 出水COD超标
     if outlet['COD'] > DESIGN_LIMITS['COD']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['COD'] > 45 else 'warning',
             'indicator': '出水COD',
             'current': f"{outlet['COD']:.1f} mg/L",
             'title': f"{'🚨' if outlet['COD'] > 45 else '⚠️'} 出水COD超标（>{DESIGN_LIMITS['COD']['value']} mg/L）",
-            'reasons': [
-                f'进水COD负荷过高（当前进水{inlet["COD"]:.0f} mg/L）',
-                f'好氧段DO不足（当前{do:.1f} mg/L，建议2.5-3.0）',
-                '污泥老化或解体：出水携带细小絮体',
-                '二沉池跑泥：污泥沉降性能变差',
-                '碳源投加不足：反硝化碳源缺乏'
-            ],
-            'actions': [
-                f'增加碳源投加量20-30%（当前{int(carbon)}→{int(carbon*1.25)} mg/L）',
-                f'提高好氧段DO至2.5-3.0 mg/L（当前{do:.1f}）',
-                '加大排泥量20-30%，更新污泥龄',
-                '检查二沉池刮泥机运行状态，调整回流比至60-80%',
-                '8小时后评估COD去除效果'
-            ]
+            'reasons': [f'进水COD负荷过高（{inlet["COD"]:.0f} mg/L）', f'DO不足（{do:.1f}）', '污泥老化', '二沉池跑泥'],
+            'actions': [f'增加碳源{int(carbon)}→{int(carbon*1.25)}', f'提高DO至2.5-3.0', '加大排泥20-30%', '检查二沉池']
         })
     
-    # 6. 出水NH3-N超标
+    # 出水NH3-N超标（使用优化后的预测值）
     if outlet['NH3-N'] > DESIGN_LIMITS['NH3-N']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['NH3-N'] > 3.0 else 'warning',
             'indicator': '出水NH₃-N',
             'current': f"{outlet['NH3-N']:.2f} mg/L",
             'title': f"{'🚨' if outlet['NH3-N'] > 3.0 else '⚠️'} 出水NH₃-N超标（>{DESIGN_LIMITS['NH3-N']['value']} mg/L）",
-            'reasons': [
-                f'硝化菌活性受抑制（DO={do:.1f}，需≥2.5）',
-                '碱度不足：硝化消耗碱度，pH可能偏低',
-                f'污泥龄太短：硝化菌世代时间>10天，当前SRT可能不足',
-                f'进水NH₃-N冲击（当前进水{inlet["NH3-N"]:.1f} mg/L）',
-                '水温过低：硝化菌在<15℃活性显著下降'
-            ],
-            'actions': [
-                f'提高好氧段DO至3.0-3.5 mg/L（当前{do:.1f}）',
-                '补充碱度，投加NaHCO₃ 50-80 mg/L维持pH 7.2-7.8',
-                '延长污泥龄至15天以上，减少排泥量',
-                '降低进水量15%，减轻硝化负荷',
-                '6小时后评估硝化效果'
-            ]
+            'reasons': [f'DO不足（{do:.1f}）', '碱度不足', 'SRT太短', '进水冲击'],
+            'actions': ['提高DO至3.0-3.5', '补充NaHCO₃ 50-80mg/L', '延长SRT至15天以上', '降低进水量15%']
         })
     
-    # 7. 出水TP超标
+    # 出水TP超标
     if outlet['TP'] > DESIGN_LIMITS['TP']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['TP'] > 0.6 else 'warning',
             'indicator': '出水TP',
             'current': f"{outlet['TP']:.3f} mg/L",
             'title': f"{'🚨' if outlet['TP'] > 0.6 else '⚠️'} 出水TP超标（>{DESIGN_LIMITS['TP']['value']} mg/L）",
-            'reasons': [
-                f'PAC投加量不足（当前{pac:.0f} mg/L，建议30-60 mg/L）',
-                '混凝pH不适宜（最佳6.5-7.5，请检查）',
-                'PAC投加点位置不当：需在混合反应池入口',
-                '污泥中磷释放：厌氧条件或排泥不足',
-                f'进水TP过高（当前{inlet["TP"]:.2f} mg/L，超出设计值）'
-            ],
-            'actions': [
-                f'增加PAC投加量30-50%（当前{pac:.0f}→{int(pac*1.4)} mg/L）',
-                '调整PAC投加点至混合反应池入口，增加混凝反应时间',
-                '检查并调节pH至6.5-7.5最佳范围',
-                '增加排泥量，防止含磷污泥厌氧释磷',
-                '22小时后评估除磷效果'
-            ]
+            'reasons': [f'PAC不足（{pac:.0f} mg/L）', 'pH不适宜', '投加点不当', '磷释放'],
+            'actions': [f'增加PAC {pac}→{int(pac*1.4)}', '调整投加点', '检查pH', '增加排泥']
         })
     
-    # 8. 出水SS超标
+    # 出水SS超标
     if outlet['SS'] > DESIGN_LIMITS['SS']['value']:
         diagnoses.append({
             'level': 'warning',
             'indicator': '出水SS',
             'current': f"{outlet['SS']:.1f} mg/L",
-            'title': f"⚠️ 出水SS超标（>{DESIGN_LIMITS['SS']['value']} mg/L）",
-            'reasons': [
-                '二沉池表面负荷过高：进水量过大',
-                '污泥沉降性能变差（SVI升高）',
-                '排泥不足，二沉池泥层过厚',
-                '刮泥机运行故障或速度不当'
-            ],
-            'actions': [
-                '增加排泥频率20-30%',
-                '投加PAM絮凝剂改善污泥沉降性',
-                '降低进水量10-15%',
-                '检查刮泥机运行状态'
-            ]
+            'title': '⚠️ 出水SS超标（>{DESIGN_LIMITS['SS']['value']} mg/L）',
+            'reasons': ['表面负荷过高', 'SVI升高', '排泥不足'],
+            'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })
     
-    # 9. 运行参数诊断 - DO
+    # 运行参数诊断
     if do < 0.8:
         diagnoses.append({
             'level': 'critical',
             'indicator': '溶解氧DO',
             'current': f"{do:.1f} mg/L",
             'title': '🚨 好氧段DO严重不足（<0.8 mg/L）',
-            'reasons': [
-                '曝气设备故障或效率下降',
-                '进水负荷突然增大，耗氧量激增',
-                '风机运行参数设置不当'
-            ],
-            'actions': [
-                '【立即执行】检查曝气设备运行状态',
-                '【立即执行】加大风机风量20-30%',
-                '检查风机出口压力是否正常',
-                '4小时内恢复DO至2.0 mg/L以上'
-            ]
+            'reasons': ['曝气设备故障', '进水负荷突增', '风机参数设置不当'],
+            'actions': ['检查曝气设备', '加大风机风量20-30%', '检查风机出口压力']
         })
     elif do < 1.5:
         diagnoses.append({
@@ -497,36 +391,18 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '溶解氧DO',
             'current': f"{do:.1f} mg/L",
             'title': '⚠️ 好氧段DO偏低（<1.5 mg/L）',
-            'reasons': [
-                '曝气量不足，需增加风量',
-                '进水负荷增加，耗氧速率加快',
-                '水温升高导致饱和DO降低'
-            ],
-            'actions': [
-                '增加曝气量10-20%',
-                '监测好氧段DO变化趋势',
-                '检查风机变频器设置'
-            ]
+            'reasons': ['曝气量不足', '进水负荷增加', '水温升高'],
+            'actions': ['增加曝气量10-20%', '监测DO变化趋势', '检查风机变频器']
         })
     
-    # 10. 运行参数诊断 - MLSS
     if mlss < 2500:
         diagnoses.append({
             'level': 'warning',
             'indicator': '污泥浓度MLSS',
             'current': f"{mlss:.0f} mg/L",
             'title': '⚠️ 污泥浓度偏低（<2500 mg/L）',
-            'reasons': [
-                '污泥流失过多：排泥过量或跑泥',
-                '进水负荷过低：微生物缺乏营养',
-                '污泥回流量不足'
-            ],
-            'actions': [
-                '减少排泥量，提高污泥浓度',
-                '增加污泥回流量',
-                '检查二沉池是否跑泥',
-                '适当增加碳源投加'
-            ]
+            'reasons': ['污泥流失过多', '进水负荷过低', '污泥回流量不足'],
+            'actions': ['减少排泥量', '增加污泥回流量', '检查二沉池是否跑泥']
         })
     elif mlss > 6000:
         diagnoses.append({
@@ -534,35 +410,18 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '污泥浓度MLSS',
             'current': f"{mlss:.0f} mg/L",
             'title': 'ℹ️ 污泥浓度偏高（>6000 mg/L）',
-            'reasons': [
-                '排泥不足，污泥积累',
-                '二沉池泥层过厚',
-                '进水SS过高'
-            ],
-            'actions': [
-                '增加排泥量',
-                '检查二沉池泥位',
-                '注意氧传输效率下降问题'
-            ]
+            'reasons': ['排泥不足', '二沉池泥层过厚', '进水SS过高'],
+            'actions': ['增加排泥量', '检查二沉池泥位', '注意氧传输效率']
         })
     
-    # 11. 运行参数诊断 - PAC
     if pac < 20:
         diagnoses.append({
             'level': 'warning',
             'indicator': 'PAC投加量',
             'current': f"{pac:.0f} mg/L",
             'title': '⚠️ PAC投加量偏低（<20 mg/L）',
-            'reasons': [
-                'PAC储备不足',
-                '加药泵故障或计量不准',
-                '人为调低投加量'
-            ],
-            'actions': [
-                f'增加PAC投加量至30-50 mg/L（当前{pac:.0f}）',
-                '检查加药泵运行状态',
-                '核查PAC库存，及时补充'
-            ]
+            'reasons': ['PAC储备不足', '加药泵故障', '人为调低'],
+            'actions': ['增加PAC至30-50 mg/L', '检查加药泵', '核查PAC库存']
         })
     elif pac > 80:
         diagnoses.append({
@@ -570,33 +429,18 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': 'PAC投加量',
             'current': f"{pac:.0f} mg/L",
             'title': 'ℹ️ PAC投加量偏高（>80 mg/L）',
-            'reasons': [
-                '为应对高负荷临时加大投加',
-                '自动加药系统参数设置过高'
-            ],
-            'actions': [
-                '评估是否可适当降低投加量',
-                '检查出水TP是否已达标',
-                '防止过量加药导致污泥产量增加'
-            ]
+            'reasons': ['为应对高负荷临时加大', '自动加药参数过高'],
+            'actions': ['评估是否可降低', '检查出水TP是否达标', '防止过量加药']
         })
     
-    # 12. 运行参数诊断 - 碳源
     if carbon < 30:
         diagnoses.append({
             'level': 'warning',
             'indicator': '碳源投加量',
             'current': f"{carbon:.0f} mg/L",
             'title': '⚠️ 碳源投加量偏低（<30 mg/L）',
-            'reasons': [
-                '碳源储备不足',
-                '反硝化碳源缺乏，可能影响脱氮效果'
-            ],
-            'actions': [
-                f'增加碳源投加量至40-60 mg/L（当前{carbon:.0f}）',
-                '检查碳源储罐液位',
-                '关注出水TN变化趋势'
-            ]
+            'reasons': ['碳源储备不足', '反硝化碳源缺乏'],
+            'actions': ['增加碳源至40-60 mg/L', '检查碳源储罐液位']
         })
     elif carbon > 100:
         diagnoses.append({
@@ -604,15 +448,8 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'indicator': '碳源投加量',
             'current': f"{carbon:.0f} mg/L",
             'title': 'ℹ️ 碳源投加量偏高（>100 mg/L）',
-            'reasons': [
-                '为应对高负荷临时加大投加',
-                '碳源计量误差或设备故障'
-            ],
-            'actions': [
-                '评估是否可逐步降低投加量',
-                '检查出水COD和TN是否已达标',
-                '核查碳源计量设备'
-            ]
+            'reasons': ['为应对高负荷临时加大', '碳源计量误差'],
+            'actions': ['评估是否可逐步降低', '检查出水COD和TN']
         })
     
     return diagnoses
@@ -686,9 +523,11 @@ else:
 # 主界面
 # ==========================================
 if input_data is not None:
-    pred_cod = predict_one(input_data, 'COD_out', models, feature_cols, scaler)
-    pred_nh3 = predict_one(input_data, 'NH3-N_out', models, feature_cols, scaler)
-    pred_tp = predict_one(input_data, 'TP_out', models, feature_cols, scaler)
+    # COD 和 TP 使用通用模型
+    pred_cod = predict_cod_tp(input_data, 'COD_out', models, feature_cols, scaler)
+    pred_tp = predict_cod_tp(input_data, 'TP_out', models, feature_cols, scaler)
+    # NH3-N 使用优化后的对数变换模型
+    pred_nh3 = predict_nh3_optimized(input_data, nh3_model, nh3_scaler, nh3_feature_cols)
     pred_ss = max(0, 5 + np.random.normal(0, 0.5))
 
     inlet = {'COD': cod_in, 'NH3-N': nh3_in, 'TP': tp_in, 'SS': ss_in, '流量': flow_in}
@@ -914,4 +753,4 @@ else:
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v5.5 | 出水标准：准Ⅳ类 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v5.6 | 出水标准：准Ⅳ类 | NH₃-N使用优化对数模型 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

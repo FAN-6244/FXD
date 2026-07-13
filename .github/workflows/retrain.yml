@@ -11,19 +11,23 @@ jobs:
     steps:
       - name: 拉取代码
         uses: actions/checkout@v3
+
       - name: 设置 Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
       - name: 安装依赖
         run: |
           pip install pandas numpy xgboost scikit-learn supabase openpyxl
+
       - name: 重训模型
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python retrain_from_db.py
+
       - name: 提交新模型
         run: |
           git config --local user.email "action@github.com"

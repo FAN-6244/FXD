@@ -1,6 +1,6 @@
 """
 smart_warning_panel_deploy.py
-部署到 Streamlit Cloud —— 手动/自动双模式 + 实测预测趋势区分
+部署到 Streamlit Cloud —— 手动/自动双模式 + 实测预测趋势区分 + 完整决策优化
 """
 
 import streamlit as st
@@ -157,12 +157,12 @@ MEMORY = {
 }
 
 # ==========================================
-# 数据缓存管理（存储最近24小时数据）
+# 数据缓存管理
 # ==========================================
 class DataBuffer:
     def __init__(self, max_hours=48):
         self.max_hours = max_hours
-        self.data = []  # 每个元素: {timestamp, inlet:{...}, outlet:{...}, pred_outlet:{...}}
+        self.data = []
     
     def add_data(self, timestamp, inlet, outlet, pred_outlet):
         self.data.append({
@@ -171,7 +171,6 @@ class DataBuffer:
             'outlet': outlet.copy() if outlet else None,
             'pred_outlet': pred_outlet.copy() if pred_outlet else None
         })
-        # 只保留最近 max_hours 小时的数据
         cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=self.max_hours)
         self.data = [d for d in self.data if d['timestamp'] >= cutoff]
     
@@ -183,7 +182,7 @@ class DataBuffer:
         return self.data
 
 # ==========================================
-# 加载预训练模型（放入 session_state 以便微调）
+# 加载预训练模型
 # ==========================================
 @st.cache_resource
 def load_base_models():
@@ -258,7 +257,7 @@ with col_s3:
 # ==========================================
 # 预测函数
 # ==========================================
-def predict_cod_tp(input_data, target, feature_cols, scaler):
+def predict_cod_tp(input_data, target):
     if input_data is None:
         return None
     try:
@@ -306,13 +305,11 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
 # 生成模拟实时数据
 # ==========================================
 def generate_simulated_data():
-    """模拟实时数据，用于演示自动模式"""
     base_cod = 200 + np.random.normal(0, 30)
     base_nh3 = 20 + np.random.normal(0, 3)
     base_tp = 3.0 + np.random.normal(0, 0.4)
     base_ss = 150 + np.random.normal(0, 20)
     base_flow = 10000 + np.random.normal(0, 500)
-    
     return {
         'COD': max(0, base_cod),
         'NH3-N': max(0, base_nh3),
@@ -326,7 +323,6 @@ def generate_simulated_data():
     }
 
 def simulate_outlet(inlet):
-    """模拟真实出水值（供自动校准使用）"""
     return {
         'COD': 8 + np.random.normal(0, 0.8) + inlet['COD'] * 0.01,
         'NH3-N': 0.05 + np.random.normal(0, 0.01) + inlet['NH3-N'] * 0.003,
@@ -344,7 +340,6 @@ def calibrate_model(target, X_new, y_real):
         current_model = st.session_state.model_tp_tunable
     else:
         return None, "不支持的指标"
-    
     try:
         X_scaled = scaler.transform(X_new.reshape(1, -1))
         dtrain = xgb.DMatrix(X_scaled, label=np.array([y_real]))
@@ -366,17 +361,18 @@ def calibrate_model(target, X_new, y_real):
         return None, f"❌ 失败: {str(e)}"
 
 # ==========================================
-# 诊断函数
+# 完整诊断函数
 # ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
+    # 进水COD
     if inlet['COD'] > 500:
         diagnoses.append({
             'level': 'critical',
             'indicator': '进水COD',
             'current': f"{inlet['COD']:.0f} mg/L",
             'title': '🚨 进水COD严重超标（>500 mg/L）',
-            'reasons': ['工业废水偷排高浓度有机废水', '管网沉积物冲刷', '污泥厌氧消化液回流'],
+            'reasons': ['工业废水偷排', '管网沉积物冲刷', '污泥厌氧消化液回流'],
             'actions': ['增加碳源投加量30-40%', '提高好氧段DO至3.0-3.5 mg/L', '降低进水量15-20%']
         })
     elif inlet['COD'] > 400:
@@ -397,7 +393,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['雨水稀释', '上游截流'],
             'actions': ['减少碳源投加量20-30%', '适当降低曝气量']
         })
-    
+    # 进水NH3-N
     if inlet['NH3-N'] > 45:
         diagnoses.append({
             'level': 'critical',
@@ -416,7 +412,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['上游氨氮浓度升高', '硝化菌活性受抑制'],
             'actions': ['提高DO至3.0-3.5 mg/L', '补充碱度50-80 mg/L']
         })
-    
+    # 进水TP
     if inlet['TP'] > 7.0:
         diagnoses.append({
             'level': 'critical',
@@ -435,7 +431,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['上游含磷废水浓度波动', 'PAC投加量相对不足'],
             'actions': ['增加PAC投加量20-30%', '检查pH并调节']
         })
-    
+    # 进水SS
     if inlet['SS'] > 350:
         diagnoses.append({
             'level': 'warning',
@@ -445,7 +441,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['管网冲刷', '初沉池运行异常'],
             'actions': ['增加初沉池排泥频率', '投加PAM絮凝剂']
         })
-    
+    # 出水COD
     if outlet['COD'] > DESIGN_LIMITS['COD']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['COD'] > 45 else 'warning',
@@ -455,7 +451,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'进水COD负荷过高（{inlet["COD"]:.0f}）', f'DO不足（{do:.1f}）', '污泥老化'],
             'actions': [f'增加碳源{int(carbon)}→{int(carbon*1.25)}', f'提高DO至2.5-3.0']
         })
-    
+    # 出水NH3-N
     if outlet['NH3-N'] > DESIGN_LIMITS['NH3-N']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['NH3-N'] > 3.0 else 'warning',
@@ -465,7 +461,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'DO不足（{do:.1f}）', '碱度不足', 'SRT太短'],
             'actions': ['提高DO至3.0-3.5', '补充NaHCO₃ 50-80mg/L', '延长SRT至15天以上']
         })
-    
+    # 出水TP
     if outlet['TP'] > DESIGN_LIMITS['TP']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['TP'] > 0.6 else 'warning',
@@ -475,7 +471,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': [f'PAC不足（{pac:.0f}）', 'pH不适宜', '磷释放'],
             'actions': [f'增加PAC {pac}→{int(pac*1.4)}', '调整投加点', '增加排泥']
         })
-    
+    # 出水SS
     if outlet['SS'] > DESIGN_LIMITS['SS']['value']:
         diagnoses.append({
             'level': 'warning',
@@ -485,7 +481,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['表面负荷过高', 'SVI升高', '排泥不足'],
             'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })
-    
+    # DO
     if do < 0.8:
         diagnoses.append({
             'level': 'critical',
@@ -504,7 +500,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['曝气量不足', '进水负荷增加'],
             'actions': ['增加曝气量10-20%', '监测DO变化趋势']
         })
-    
+    # MLSS
     if mlss < 2500:
         diagnoses.append({
             'level': 'warning',
@@ -523,7 +519,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['排泥不足', '二沉池泥层过厚'],
             'actions': ['增加排泥量', '检查二沉池泥位']
         })
-    
+    # PAC
     if pac < 20:
         diagnoses.append({
             'level': 'warning',
@@ -542,7 +538,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['为应对高负荷临时加大'],
             'actions': ['评估是否可降低', '检查出水TP是否达标']
         })
-    
+    # 碳源
     if carbon < 30:
         diagnoses.append({
             'level': 'warning',
@@ -561,15 +557,12 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'reasons': ['为应对高负荷临时加大'],
             'actions': ['评估是否可逐步降低', '检查出水COD和TN']
         })
-    
     return diagnoses
 
 # ==========================================
-# 侧边栏：手动/自动模式切换 + 数据输入
+# 侧边栏：手动/自动模式切换
 # ==========================================
 st.sidebar.markdown("## 📊 数据输入模式")
-
-# 模式切换
 input_mode_global = st.sidebar.radio(
     "选择数据模式",
     ["✏️ 手动输入", "📡 自动实时（模拟）"],
@@ -577,9 +570,6 @@ input_mode_global = st.sidebar.radio(
     help="手动模式适合单次预测和演示；自动模式模拟实时数据流，支持自动微调"
 )
 
-# ==========================================
-# 手动模式
-# ==========================================
 if input_mode_global == "✏️ 手动输入":
     st.sidebar.markdown("### 进水实测")
     c1, c2 = st.sidebar.columns(2)
@@ -590,7 +580,6 @@ if input_mode_global == "✏️ 手动输入":
         tp_in = st.number_input("TP (mg/L)", min_value=0.0, value=3.0, key="manual_tp")
         ss_in = st.number_input("SS (mg/L)", min_value=0.0, value=150.0, key="manual_ss")
     flow_in = st.sidebar.number_input("流量 (m³/h)", min_value=0.0, value=10000.0, key="manual_flow")
-    
     st.sidebar.markdown("### 运行参数")
     c3, c4 = st.sidebar.columns(2)
     with c3:
@@ -599,34 +588,21 @@ if input_mode_global == "✏️ 手动输入":
     with c4:
         mlss = st.number_input("MLSS (mg/L)", min_value=0.0, value=4000.0, key="manual_mlss")
         do = st.number_input("DO (mg/L)", min_value=0.0, value=2.0, key="manual_do")
-    
     input_data = build_input_with_lags(cod_in, nh3_in, tp_in, ss_in, flow_in, pac, carbon, mlss, do)
     st.sidebar.info("💡 手动模式：修改参数后自动更新预测")
 
-# ==========================================
-# 自动模式
-# ==========================================
 else:
     st.sidebar.markdown("### 📡 自动实时数据")
     st.sidebar.info("🔄 每5秒自动生成一组模拟数据，模拟实时数据流")
-    
-    # API配置（预留真实API对接）
-    api_url = st.sidebar.text_input(
-        "API地址（可选）", 
-        value="http://localhost:8080/api/data",
-        help="如有真实API，输入地址后系统将从此拉取数据"
-    )
+    api_url = st.sidebar.text_input("API地址（可选）", value="http://localhost:8080/api/data")
     use_api = st.sidebar.checkbox("使用真实API", value=False)
-    
     if st.sidebar.button("▶️ 启动实时数据流"):
         st.session_state.auto_mode_running = True
         st.sidebar.success("✅ 数据流已启动")
-    
     if st.sidebar.button("⏹️ 停止数据流"):
         st.session_state.auto_mode_running = False
         st.sidebar.info("⏹️ 数据流已停止")
     
-    # 生成模拟数据（自动模式下使用）
     simulated_inlet = generate_simulated_data()
     cod_in = simulated_inlet['COD']
     nh3_in = simulated_inlet['NH3-N']
@@ -637,12 +613,8 @@ else:
     carbon = simulated_inlet['碳源']
     mlss = simulated_inlet['MLSS']
     do = simulated_inlet['DO']
-    
     input_data = build_input_with_lags(cod_in, nh3_in, tp_in, ss_in, flow_in, pac, carbon, mlss, do)
-    
-    # 模拟真实出水值（用于自动校准）
     simulated_outlet = simulate_outlet(simulated_inlet)
-    
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"""
     <div class="data-status-realtime">
@@ -654,9 +626,8 @@ else:
 # 主界面
 # ==========================================
 if input_data is not None:
-    # ---- 预测 ----
-    pred_cod = predict_cod_tp(input_data, 'COD_out', feature_cols, scaler)
-    pred_tp = predict_cod_tp(input_data, 'TP_out', feature_cols, scaler)
+    pred_cod = predict_cod_tp(input_data, 'COD_out')
+    pred_tp = predict_cod_tp(input_data, 'TP_out')
     pred_nh3 = predict_nh3_optimized(input_data)
     pred_ss = max(0, 5 + np.random.normal(0, 0.5))
 
@@ -666,20 +637,15 @@ if input_data is not None:
                    'TP': pred_tp if pred_tp else 0, 
                    'SS': pred_ss}
     
-    # ---- 自动模式：获取真实出水并自动微调 ----
+    # ---- 自动模式处理 ----
     if input_mode_global == "📡 自动实时（模拟）" and st.session_state.auto_mode_running:
-        # 模拟真实出水
         real_outlet = {
             'COD': max(0, simulated_outlet['COD'] + np.random.normal(0, 0.3)),
             'NH3-N': max(0, simulated_outlet['NH3-N'] + np.random.normal(0, 0.005)),
             'TP': max(0, simulated_outlet['TP'] + np.random.normal(0, 0.005)),
             'SS': max(0, simulated_outlet['SS'] + np.random.normal(0, 0.2))
         }
-        
-        # 自动微调 COD 和 TP
         vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in feature_cols])
-        
-        # 每5组数据微调一次（避免过度微调）
         if st.session_state.simulation_counter % 5 == 0 and st.session_state.simulation_counter > 0:
             if real_outlet['COD'] > 0:
                 calibrate_model('COD_out', vec, real_outlet['COD'])
@@ -693,37 +659,27 @@ if input_data is not None:
                 'tp_pred': outlet_pred['TP'],
                 'tp_real': real_outlet['TP']
             })
-        
-        # 保存到数据缓存
         st.session_state.data_buffer.add_data(
             timestamp=datetime.now(BEIJING_TZ),
             inlet=inlet,
             outlet=real_outlet,
             pred_outlet=outlet_pred
         )
-        
-        # 更新计数器
         st.session_state.simulation_counter += 1
-        
-        # 显示实时状态
         st.info(f"🔄 实时数据流运行中... 已接收 {st.session_state.simulation_counter} 组数据 | 已微调 {st.session_state.calibration_count} 次")
-        
-        # 在界面上显示真实值（如果运行中）
         outlet_display = real_outlet
-        st.caption("📌 自动模式下，出水值 = 真实实测值（模拟） + 预测值（模型）对比显示")
-    
+        outlet_label = "实测"
     else:
-        # 手动模式下，出水值就是预测值
         outlet_display = outlet_pred.copy()
-        # 手动模式也保存到缓存（用于趋势图）
         st.session_state.data_buffer.add_data(
             timestamp=datetime.now(BEIJING_TZ),
             inlet=inlet,
             outlet=None,
             pred_outlet=outlet_pred
         )
+        outlet_label = "预测"
 
-    # ---- 更新状态 ----
+    # ---- 状态更新 ----
     has_abnormal = False
     for key in ['COD', 'NH3-N', 'TP', 'SS']:
         if outlet_pred.get(key, 0) > DESIGN_LIMITS[key]['value']:
@@ -731,7 +687,6 @@ if input_data is not None:
             break
     if inlet.get('COD', 0) > 400 or inlet.get('NH3-N', 0) > 35 or inlet.get('TP', 0) > 5:
         has_abnormal = True
-
     status_text = "异常" if has_abnormal else "正常"
     status_color = "value-critical" if has_abnormal else "value-normal"
     with status_placeholder:
@@ -742,15 +697,11 @@ if input_data is not None:
         </div>
         """, unsafe_allow_html=True)
 
-    # ==========================================
-    # 进出水水质面板
-    # ==========================================
+    # ---- 进出水水质面板 ----
     st.markdown('<div class="section-header">📊 进出水水质实时监测</div>', unsafe_allow_html=True)
     st.caption(f"📌 出水设计标准：COD≤{DESIGN_LIMITS['COD']['value']} | NH₃-N≤{DESIGN_LIMITS['NH3-N']['value']} | TP≤{DESIGN_LIMITS['TP']['value']} | SS≤{DESIGN_LIMITS['SS']['value']} mg/L")
 
     col_left, col_right = st.columns(2, gap="medium")
-    
-    # ---- 进水 ----
     with col_left:
         st.markdown("""
         <div class="water-card-in">
@@ -768,55 +719,31 @@ if input_data is not None:
             st.markdown(f"""<div class="metric-card"><div class="label">流量</div><div class="value">{inlet['流量']:.0f} <span style="font-size:13px;font-weight:400;color:#888;">m³/h</span></div></div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ---- 出水 ----
     with col_right:
-        st.markdown("""
+        st.markdown(f"""
         <div class="water-card-out">
             <div style="font-size:15px; font-weight:600; color:#1a5c3a; margin-bottom:6px;">
-                🟢 出水水质
-                <span style="font-size:11px; font-weight:400; color:#888;">
-                    （{'实测' if input_mode_global == '📡 自动实时（模拟）' and st.session_state.auto_mode_running else '预测'}）
-                </span>
+                🟢 出水水质 <span style="font-size:11px; font-weight:400; color:#888;">（{outlet_label}）</span>
             </div>
         """, unsafe_allow_html=True)
-        
-        # 判断自动模式下是否显示真实值
-        is_auto = (input_mode_global == "📡 自动实时（模拟）" and st.session_state.auto_mode_running)
-        
-        if is_auto:
-            display_outlet = outlet_display  # 真实值
-            cod_ok = display_outlet['COD'] <= DESIGN_LIMITS['COD']['value']
-            nh3_ok = display_outlet['NH3-N'] <= DESIGN_LIMITS['NH3-N']['value']
-            tp_ok = display_outlet['TP'] <= DESIGN_LIMITS['TP']['value']
-            ss_ok = display_outlet['SS'] <= DESIGN_LIMITS['SS']['value']
-            
-            st.caption(f"📊 实测值（同时预测值：COD={outlet_pred['COD']:.1f}）")
-        else:
-            display_outlet = outlet_pred
-            cod_ok = display_outlet['COD'] <= DESIGN_LIMITS['COD']['value']
-            nh3_ok = display_outlet['NH3-N'] <= DESIGN_LIMITS['NH3-N']['value']
-            tp_ok = display_outlet['TP'] <= DESIGN_LIMITS['TP']['value']
-            ss_ok = display_outlet['SS'] <= DESIGN_LIMITS['SS']['value']
-        
+        cod_ok = outlet_display['COD'] <= DESIGN_LIMITS['COD']['value']
+        nh3_ok = outlet_display['NH3-N'] <= DESIGN_LIMITS['NH3-N']['value']
+        tp_ok = outlet_display['TP'] <= DESIGN_LIMITS['TP']['value']
+        ss_ok = outlet_display['SS'] <= DESIGN_LIMITS['SS']['value']
         cc3, cc4 = st.columns(2)
         with cc3:
-            st.markdown(f"""<div class="metric-card"><div class="label">COD <span class="limit-ref">限值≤{DESIGN_LIMITS['COD']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if cod_ok else '#C0392B'}">{display_outlet['COD']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if cod_ok else f'🔴 超标{display_outlet["COD"]-DESIGN_LIMITS["COD"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
-            st.markdown(f"""<div class="metric-card"><div class="label">NH₃-N <span class="limit-ref">限值≤{DESIGN_LIMITS['NH3-N']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if nh3_ok else '#C0392B'}">{display_outlet['NH3-N']:.2f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if nh3_ok else f'🔴 超标{display_outlet["NH3-N"]-DESIGN_LIMITS["NH3-N"]["value"]:.2f}'}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="metric-card"><div class="label">COD <span class="limit-ref">限值≤{DESIGN_LIMITS['COD']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if cod_ok else '#C0392B'}">{outlet_display['COD']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if cod_ok else f'🔴 超标{outlet_display["COD"]-DESIGN_LIMITS["COD"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="metric-card"><div class="label">NH₃-N <span class="limit-ref">限值≤{DESIGN_LIMITS['NH3-N']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if nh3_ok else '#C0392B'}">{outlet_display['NH3-N']:.2f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if nh3_ok else f'🔴 超标{outlet_display["NH3-N"]-DESIGN_LIMITS["NH3-N"]["value"]:.2f}'}</div></div>""", unsafe_allow_html=True)
         with cc4:
-            st.markdown(f"""<div class="metric-card"><div class="label">TP <span class="limit-ref">限值≤{DESIGN_LIMITS['TP']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if tp_ok else '#C0392B'}">{display_outlet['TP']:.3f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if tp_ok else f'🔴 超标{display_outlet["TP"]-DESIGN_LIMITS["TP"]["value"]:.3f}'}</div></div>""", unsafe_allow_html=True)
-            st.markdown(f"""<div class="metric-card"><div class="label">SS <span class="limit-ref">限值≤{DESIGN_LIMITS['SS']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if ss_ok else '#C0392B'}">{display_outlet['SS']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if ss_ok else f'🔴 超标{display_outlet["SS"]-DESIGN_LIMITS["SS"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
-        
+            st.markdown(f"""<div class="metric-card"><div class="label">TP <span class="limit-ref">限值≤{DESIGN_LIMITS['TP']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if tp_ok else '#C0392B'}">{outlet_display['TP']:.3f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if tp_ok else f'🔴 超标{outlet_display["TP"]-DESIGN_LIMITS["TP"]["value"]:.3f}'}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="metric-card"><div class="label">SS <span class="limit-ref">限值≤{DESIGN_LIMITS['SS']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if ss_ok else '#C0392B'}">{outlet_display['SS']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if ss_ok else f'🔴 超标{outlet_display["SS"]-DESIGN_LIMITS["SS"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ==========================================
-    # 趋势图（区分实测 vs 预测）
-    # ==========================================
+    # ---- 趋势图（区分进水颜色） ----
     st.markdown('<div class="section-header">📈 进出水趋势（近24小时）</div>', unsafe_allow_html=True)
-    st.caption("🟦 实线 = 实测值 | 虚线 = 预测值")
+    st.caption("🟦 实线 = 实测值 | 虚线 = 预测值 | 🟥进水COD 🟧进水NH₃-N 🟪进水TP")
     
-    # 从数据缓存中获取最近24小时数据
     recent_data = st.session_state.data_buffer.get_recent(24)
-    
     if len(recent_data) > 1:
         df_trend = pd.DataFrame([{
             'timestamp': d['timestamp'],
@@ -831,95 +758,80 @@ if input_data is not None:
             'outlet_TP_pred': d['pred_outlet']['TP'] if d['pred_outlet'] else None,
         } for d in recent_data])
         
-        # 创建子图
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                             subplot_titles=('COD', 'NH₃-N', 'TP'))
         
-        # COD
+        # ----- COD 子图 -----
         fig.add_trace(go.Scatter(
             x=df_trend['timestamp'], y=df_trend['inlet_COD'],
-            name='进水COD', line=dict(color='#E74C3C', width=1.5, dash='solid'),
-            legendgroup='inlet'
+            name='进水COD', line=dict(color='#E74C3C', width=2, dash='solid'),
+            legendgroup='inlet_COD'
         ), row=1, col=1)
-        
-        # 出水COD - 实测（实线）
         mask_real = df_trend['outlet_COD_real'].notna()
         if mask_real.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_real]['timestamp'], 
                 y=df_trend[mask_real]['outlet_COD_real'],
                 name='出水COD_实测', line=dict(color='#2E86AB', width=2.5, dash='solid'),
-                legendgroup='outlet_real'
+                legendgroup='outlet_COD_real'
             ), row=1, col=1)
-        
-        # 出水COD - 预测（虚线）
         mask_pred = df_trend['outlet_COD_pred'].notna()
         if mask_pred.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_pred]['timestamp'], 
                 y=df_trend[mask_pred]['outlet_COD_pred'],
                 name='出水COD_预测', line=dict(color='#2E86AB', width=2, dash='dot'),
-                legendgroup='outlet_pred'
+                legendgroup='outlet_COD_pred'
             ), row=1, col=1)
+        fig.add_hline(y=DESIGN_LIMITS['COD']['value'], line_dash="dash", line_color="red", row=1, col=1)
         
-        fig.add_hline(y=DESIGN_LIMITS['COD']['value'], line_dash="dash", 
-                      line_color="red", row=1, col=1)
-        
-        # NH3-N
+        # ----- NH3-N 子图 -----
         fig.add_trace(go.Scatter(
             x=df_trend['timestamp'], y=df_trend['inlet_NH3'],
-            name='进水NH₃-N', line=dict(color='#E74C3C', width=1.5, dash='solid'),
-            legendgroup='inlet'
+            name='进水NH₃-N', line=dict(color='#F39C12', width=2, dash='solid'),  # 橙色
+            legendgroup='inlet_NH3'
         ), row=2, col=1)
-        
         mask_real = df_trend['outlet_NH3_real'].notna()
         if mask_real.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_real]['timestamp'], 
                 y=df_trend[mask_real]['outlet_NH3_real'],
                 name='出水NH₃-N_实测', line=dict(color='#27AE60', width=2.5, dash='solid'),
-                legendgroup='outlet_real'
+                legendgroup='outlet_NH3_real'
             ), row=2, col=1)
-        
         mask_pred = df_trend['outlet_NH3_pred'].notna()
         if mask_pred.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_pred]['timestamp'], 
                 y=df_trend[mask_pred]['outlet_NH3_pred'],
                 name='出水NH₃-N_预测', line=dict(color='#27AE60', width=2, dash='dot'),
-                legendgroup='outlet_pred'
+                legendgroup='outlet_NH3_pred'
             ), row=2, col=1)
+        fig.add_hline(y=DESIGN_LIMITS['NH3-N']['value'], line_dash="dash", line_color="red", row=2, col=1)
         
-        fig.add_hline(y=DESIGN_LIMITS['NH3-N']['value'], line_dash="dash", 
-                      line_color="red", row=2, col=1)
-        
-        # TP
+        # ----- TP 子图 -----
         fig.add_trace(go.Scatter(
             x=df_trend['timestamp'], y=df_trend['inlet_TP'],
-            name='进水TP', line=dict(color='#E74C3C', width=1.5, dash='solid'),
-            legendgroup='inlet'
+            name='进水TP', line=dict(color='#8E44AD', width=2, dash='solid'),  # 紫色
+            legendgroup='inlet_TP'
         ), row=3, col=1)
-        
         mask_real = df_trend['outlet_TP_real'].notna()
         if mask_real.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_real]['timestamp'], 
                 y=df_trend[mask_real]['outlet_TP_real'],
                 name='出水TP_实测', line=dict(color='#F39C12', width=2.5, dash='solid'),
-                legendgroup='outlet_real'
+                legendgroup='outlet_TP_real'
             ), row=3, col=1)
-        
         mask_pred = df_trend['outlet_TP_pred'].notna()
         if mask_pred.any():
             fig.add_trace(go.Scatter(
                 x=df_trend[mask_pred]['timestamp'], 
                 y=df_trend[mask_pred]['outlet_TP_pred'],
                 name='出水TP_预测', line=dict(color='#F39C12', width=2, dash='dot'),
-                legendgroup='outlet_pred'
+                legendgroup='outlet_TP_pred'
             ), row=3, col=1)
-        
-        fig.add_hline(y=DESIGN_LIMITS['TP']['value'], line_dash="dash", 
-                      line_color="red", row=3, col=1)
+        fig.add_hline(y=DESIGN_LIMITS['TP']['value'], line_dash="dash", line_color="red", row=3, col=1)
         
         fig.update_layout(height=450, showlegend=True, hovermode='x unified')
         fig.update_xaxes(title_text="时间（北京时间）", row=3, col=1)
@@ -927,12 +839,9 @@ if input_data is not None:
     else:
         st.info("📭 数据收集中... 请等待更多数据点（至少2个时间点）")
 
-    # ---- 记忆长度、时序决策、异常诊断（与原版相同，不再重复） ----
-    # （此处省略完整版，保持与之前一致）
-    
-    # 简单占位，实际部署时需要补全
+    # ---- 记忆长度与分频调控 ----
     st.markdown('<div class="section-header">🧠 记忆长度与分频调控策略</div>', unsafe_allow_html=True)
-    st.caption("💡 不同污染物响应速度不同，分通道制定调控策略")
+    st.caption("💡 不同污染物响应速度不同，分通道制定调控策略，避免过度调节或等待不足。")
     col_ch1, col_ch2, col_ch3 = st.columns(3)
     with col_ch1:
         st.markdown("""
@@ -940,6 +849,7 @@ if input_data is not None:
             <div class="ch-name">⚡ 快速通道</div>
             <div class="ch-value" style="color:#27AE60;">6-8h</div>
             <div class="ch-desc">NH₃-N (6h) · COD (8h) | 更新 3-4h</div>
+            <div class="ch-desc">✅ 三模型共识</div>
         </div>
         """, unsafe_allow_html=True)
     with col_ch2:
@@ -948,6 +858,7 @@ if input_data is not None:
             <div class="ch-name">🐢 慢速通道</div>
             <div class="ch-value" style="color:#F39C12;">22h</div>
             <div class="ch-desc">TP (≈22h) | 更新 8-12h</div>
+            <div class="ch-desc">✅ 三模型共识</div>
         </div>
         """, unsafe_allow_html=True)
     with col_ch3:
@@ -956,12 +867,92 @@ if input_data is not None:
             <div class="ch-name">🔴 特殊通道</div>
             <div class="ch-value" style="color:#E74C3C;">不稳定</div>
             <div class="ch-desc">SS — 实时阈值报警</div>
+            <div class="ch-desc">⚠️ 三模型不一致</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # ---- 时序决策建议 ----
+    st.markdown('<div class="section-header">⏱️ 时序决策建议（具体操作）</div>', unsafe_allow_html=True)
+    indicator = st.selectbox("选择指标", ['COD', 'NH3-N', 'TP', 'SS'])
+    mem = MEMORY[indicator]['hours']
+    current_val = outlet_display[indicator]
+    limit = DESIGN_LIMITS[indicator]['value']
+
+    if mem:
+        if indicator == 'COD':
+            steps = [
+                (0, "🚨 记录进水COD异常值，启动应急响应"),
+                (2, "📞 通知值班长，确认碳源储备"),
+                (4, "⚙️ 增加碳源投加量20%"),
+                (6, "🔍 检查好氧段DO，若<2.0则增加曝气"),
+                (8, "📊 评估出水COD变化趋势"),
+                (12, "✅ 确认COD稳定达标，逐步回调")
+            ]
+        elif indicator == 'NH3-N':
+            steps = [
+                (0, "🚨 记录进水NH₃-N异常值，启动应急响应"),
+                (2, "📞 通知值班长，准备碱度调节剂"),
+                (3, "⚙️ 提高好氧段DO至3.0-3.5 mg/L"),
+                (5, "🔍 检查碱度，若<100则补充NaHCO₃"),
+                (6, "📊 评估出水NH₃-N变化趋势"),
+                (9, "✅ 确认NH₃-N稳定达标")
+            ]
+        elif indicator == 'TP':
+            steps = [
+                (0, "🚨 记录进水TP异常值，启动应急响应"),
+                (4, "📞 通知值班长，确认PAC储备"),
+                (8, "⚙️ 增加PAC投加量30%"),
+                (14, "🔍 检查pH，若<6.5则投加碱调节"),
+                (22, "📊 评估出水TP变化趋势"),
+                (33, "✅ 确认TP稳定达标，逐步回调")
+            ]
+        else:
+            steps = [
+                (0, "🚨 SS超标，启动应急响应"),
+                (1, "📞 检查二沉池刮泥机"),
+                (2, "⚙️ 增加排泥量20%"),
+                (3, "🔍 检查SVI，若>150投加PAM"),
+                (4, "📊 评估SS变化"),
+                (6, "✅ 确认达标")
+            ]
+        st.markdown('<div style="background:#FAFBFC;border-radius:8px;padding:10px 14px;border:1px solid #E8ECF0;">', unsafe_allow_html=True)
+        st.markdown(f"**📋 {indicator}：{current_val:.2f} / {limit} mg/L**")
+        st.markdown("---")
+        for t, action in steps:
+            st.markdown(f"""
+            <div class="timeline-step">
+                <div class="timeline-time">⏱️ {t}h</div>
+                <div class="timeline-action">{action}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---- 异常诊断与工艺优化 ----
+    st.markdown('<div class="section-header">🔍 异常诊断与工艺优化建议</div>', unsafe_allow_html=True)
+    st.caption("💡 基于同类型A²/O工艺经验库 + 当前工况多维度分析")
+    
+    diagnoses = diagnose_system(inlet, outlet_display, pac, carbon, mlss, do)
+    if diagnoses:
+        level_order = {'critical': 0, 'warning': 1, 'info': 2}
+        diagnoses.sort(key=lambda x: level_order.get(x['level'], 3))
+        for d in diagnoses:
+            with st.expander(f"{d['title']}（当前值：{d['current']}）", expanded=(d['level'] == 'critical')):
+                col_r, col_a = st.columns([1, 1])
+                with col_r:
+                    st.markdown("**🔍 可能原因**")
+                    for r in d['reasons']:
+                        st.markdown(f"- {r}")
+                with col_a:
+                    st.markdown("**💡 针对性工艺优化措施**")
+                    for a in d['actions']:
+                        st.markdown(f"- {a}")
+    else:
+        st.success("✅ 系统运行正常，未检测到异常")
+        st.info("📋 建议：保持当前运行参数，定期巡检设备。")
 
 else:
     st.info("👈 请左侧输入数据")
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v5.8 | 双模式（手动/自动） | 实测预测趋势区分 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v5.9 | 双模式（手动/自动） | 实测预测趋势区分 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

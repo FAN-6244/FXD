@@ -27,14 +27,11 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
         run: |
           python retrain_from_db.py
-        # 即使脚本因为数据不足等正常原因退出，也视为成功
-        continue-on-error: true
 
       - name: 提交新模型
-        # 只有文件有变动时才提交
-        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"

@@ -1,7 +1,6 @@
 """
 smart_warning_panel_deploy.py
-部署到 Streamlit Cloud 的版本 —— 加载预训练模型 + 确定性特征生成 + 北京时间
-NH3-N 使用优化后的对数变换模型
+部署到 Streamlit Cloud 的版本 —— 加载预训练模型 + 会话级微调
 """
 
 import streamlit as st
@@ -11,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pickle
+import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -118,6 +118,18 @@ st.markdown("""
     .timeline-step:last-child { border-bottom: none; }
     .timeline-time { min-width: 50px; font-weight: 700; font-size: 14px; color: #1a3a5c; }
     .timeline-action { font-size: 14px; color: #333; padding-left: 8px; }
+    /* 校准反馈样式 */
+    .calibration-success {
+        background: #E8F5E9;
+        border-radius: 8px;
+        padding: 12px 16px;
+        border-left: 4px solid #27AE60;
+        margin: 8px 0;
+    }
+    .calibration-info {
+        font-size: 13px;
+        color: #555;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -139,10 +151,10 @@ MEMORY = {
 }
 
 # ==========================================
-# 加载预训练模型（优化版：NH3-N 使用对数变换模型）
+# 加载预训练模型（放入 session_state 以便微调）
 # ==========================================
 @st.cache_resource
-def load_models():
+def load_base_models():
     status_placeholder = st.empty()
     status_placeholder.info("🔄 正在加载预训练模型...")
     try:
@@ -156,19 +168,35 @@ def load_models():
             nh3_scaler = pickle.load(f)
         with open('model_cache/nh3_optimized_feature_cols.pkl', 'rb') as f:
             nh3_feature_cols = pickle.load(f)
-        # 加载通用 scaler 和 feature_cols（用于 COD, TP）
+        # 加载通用 scaler 和 feature_cols
         with open('model_cache/scaler.pkl', 'rb') as f:
             scaler = pickle.load(f)
         with open('model_cache/feature_cols.pkl', 'rb') as f:
             feature_cols = pickle.load(f)
         
-        status_placeholder.success("✅ 模型加载成功（NH3-N 使用优化对数模型）")
+        status_placeholder.success("✅ 模型加载成功（会话级微调已启用）")
         return models, feature_cols, scaler, nh3_model, nh3_scaler, nh3_feature_cols
     except FileNotFoundError as e:
         status_placeholder.error(f"❌ 模型文件不存在: {e}")
         st.stop()
 
-models, feature_cols, scaler, nh3_model, nh3_scaler, nh3_feature_cols = load_models()
+# 加载模型
+models, feature_cols, scaler, nh3_model, nh3_scaler, nh3_feature_cols = load_base_models()
+
+# ==========================================
+# 初始化 session_state（用于存储可微调的模型）
+# ==========================================
+if 'model_cod_tunable' not in st.session_state:
+    st.session_state.model_cod_tunable = models['COD_out']
+if 'model_tp_tunable' not in st.session_state:
+    st.session_state.model_tp_tunable = models['TP_out']
+if 'feedback_log' not in st.session_state:
+    st.session_state.feedback_log = []
+if 'calibration_count' not in st.session_state:
+    st.session_state.calibration_count = 0
+if 'last_input_features' not in st.session_state:
+    st.session_state.last_input_features = None
+
 st.markdown('<div class="main-title">🏭 水质净化厂智能预警与调控决策系统</div>', unsafe_allow_html=True)
 
 # ==========================================
@@ -195,30 +223,31 @@ with col_s3:
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 预测函数
+# 预测函数（使用 session_state 中的可调模型）
 # ==========================================
-def predict_cod_tp(input_data, target, models, feature_cols, scaler):
+def predict_cod_tp(input_data, target, feature_cols, scaler):
+    """使用 session_state 中的可调模型预测 COD 和 TP"""
     if input_data is None:
         return None
     try:
         vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in feature_cols]).reshape(1, -1)
         vec_scaled = scaler.transform(vec)
-        return max(0, models[target].predict(vec_scaled)[0])
+        if target == 'COD_out':
+            return max(0, st.session_state.model_cod_tunable.predict(vec_scaled)[0])
+        elif target == 'TP_out':
+            return max(0, st.session_state.model_tp_tunable.predict(vec_scaled)[0])
     except Exception:
         return None
 
-def predict_nh3_optimized(input_data, nh3_model, nh3_scaler, nh3_feature_cols):
+def predict_nh3_optimized(input_data):
     """使用优化后的对数变换模型预测 NH3-N"""
     if input_data is None:
         return None
     try:
         vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in nh3_feature_cols]).reshape(1, -1)
         vec_scaled = nh3_scaler.transform(vec)
-        # 预测对数变换后的值
         pred_log = nh3_model.predict(vec_scaled)[0]
-        # 反向变换 expm1
-        pred = np.expm1(pred_log)
-        return max(0, pred)
+        return max(0, np.expm1(pred_log))
     except Exception:
         return None
 
@@ -246,11 +275,11 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
     return data
 
 # ==========================================
-# 智能诊断引擎（完整版，使用 f-string）
+# ==========================================
+# 诊断函数（省略，与之前相同，完整版见最后）
 # ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
-    
     # 进水COD异常
     if inlet['COD'] > 500:
         diagnoses.append({
@@ -280,7 +309,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['减少碳源投加量20-30%', '适当降低曝气量', '检查污泥浓度防止膨胀']
         })
     
-    # 进水NH3-N异常
     if inlet['NH3-N'] > 45:
         diagnoses.append({
             'level': 'critical',
@@ -300,7 +328,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['提高DO至3.0-3.5 mg/L', '补充碱度50-80 mg/L', '延长SRT至15天以上']
         })
     
-    # 进水TP异常
     if inlet['TP'] > 7.0:
         diagnoses.append({
             'level': 'critical',
@@ -320,7 +347,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['增加PAC投加量20-30%', '检查pH并调节', '检查PAC投加点位置']
         })
     
-    # 进水SS异常
     if inlet['SS'] > 350:
         diagnoses.append({
             'level': 'warning',
@@ -331,7 +357,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['增加初沉池排泥频率', '投加PAM絮凝剂', '监测二沉池泥位']
         })
     
-    # 出水COD超标
     if outlet['COD'] > DESIGN_LIMITS['COD']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['COD'] > 45 else 'warning',
@@ -342,7 +367,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': [f'增加碳源{int(carbon)}→{int(carbon*1.25)}', f'提高DO至2.5-3.0', '加大排泥20-30%', '检查二沉池']
         })
     
-    # 出水NH3-N超标
     if outlet['NH3-N'] > DESIGN_LIMITS['NH3-N']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['NH3-N'] > 3.0 else 'warning',
@@ -353,7 +377,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['提高DO至3.0-3.5', '补充NaHCO₃ 50-80mg/L', '延长SRT至15天以上', '降低进水量15%']
         })
     
-    # 出水TP超标
     if outlet['TP'] > DESIGN_LIMITS['TP']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['TP'] > 0.6 else 'warning',
@@ -364,7 +387,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': [f'增加PAC {pac}→{int(pac*1.4)}', '调整投加点', '检查pH', '增加排泥']
         })
     
-    # 出水SS超标
     if outlet['SS'] > DESIGN_LIMITS['SS']['value']:
         diagnoses.append({
             'level': 'warning',
@@ -375,7 +397,6 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })
     
-    # 运行参数诊断
     if do < 0.8:
         diagnoses.append({
             'level': 'critical',
@@ -454,8 +475,70 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     
     return diagnoses
 
+
 # ==========================================
-# 侧边栏：三种输入模式
+# 会话级微调函数
+# ==========================================
+def calibrate_model(target, X_new, y_real, feature_cols, scaler):
+    """
+    对指定模型进行增量微调
+    
+    Args:
+        target: 'COD_out' 或 'TP_out'
+        X_new: 当前样本的特征向量 (numpy array, shape: 1 x n_features)
+        y_real: 真实出水值
+        feature_cols: 特征列名列表
+        scaler: StandardScaler 对象
+    """
+    # 获取当前模型（从 session_state 中取）
+    if target == 'COD_out':
+        current_model = st.session_state.model_cod_tunable
+    elif target == 'TP_out':
+        current_model = st.session_state.model_tp_tunable
+    else:
+        return None, "不支持的指标"
+    
+    try:
+        # 标准化特征
+        X_scaled = scaler.transform(X_new.reshape(1, -1))
+        
+        # 创建 DMatrix
+        dtrain = xgb.DMatrix(X_scaled, label=np.array([y_real]))
+        
+        # 使用热启动进行增量训练
+        # 学习率设低一点（0.05），防止灾难性遗忘
+        params = {
+            'learning_rate': 0.05,
+            'max_depth': 6,
+            'n_estimators': 10,  # 只增加10棵树
+            'random_state': 42
+        }
+        
+        # 基于现有模型继续训练
+        new_model = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            xgb_model=current_model,  # 关键：基于当前模型热启动
+            num_boost_round=10,
+            verbose_eval=False
+        )
+        
+        # 更新 session_state
+        if target == 'COD_out':
+            st.session_state.model_cod_tunable = new_model
+        elif target == 'TP_out':
+            st.session_state.model_tp_tunable = new_model
+        
+        st.session_state.calibration_count += 1
+        
+        return new_model, f"✅ {target} 模型微调成功（第 {st.session_state.calibration_count} 次校准）"
+    
+    except Exception as e:
+        return None, f"❌ 微调失败: {str(e)}"
+
+
+# ==========================================
+# 侧边栏
 # ==========================================
 st.sidebar.markdown("## 📊 数据输入")
 
@@ -523,17 +606,23 @@ else:
 # 主界面
 # ==========================================
 if input_data is not None:
-    # COD 和 TP 使用通用模型
-    pred_cod = predict_cod_tp(input_data, 'COD_out', models, feature_cols, scaler)
-    pred_tp = predict_cod_tp(input_data, 'TP_out', models, feature_cols, scaler)
-    # NH3-N 使用优化后的对数变换模型
-    pred_nh3 = predict_nh3_optimized(input_data, nh3_model, nh3_scaler, nh3_feature_cols)
+    # 保存当前特征向量供微调使用
+    if st.session_state.last_input_features is None:
+        # 构建特征向量
+        vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in feature_cols])
+        st.session_state.last_input_features = vec
+    
+    # ---- 预测 ----
+    pred_cod = predict_cod_tp(input_data, 'COD_out', feature_cols, scaler)
+    pred_tp = predict_cod_tp(input_data, 'TP_out', feature_cols, scaler)
+    pred_nh3 = predict_nh3_optimized(input_data)
     pred_ss = max(0, 5 + np.random.normal(0, 0.5))
 
     inlet = {'COD': cod_in, 'NH3-N': nh3_in, 'TP': tp_in, 'SS': ss_in, '流量': flow_in}
     outlet = {'COD': pred_cod if pred_cod else 0, 'NH3-N': pred_nh3 if pred_nh3 else 0,
               'TP': pred_tp if pred_tp else 0, 'SS': pred_ss}
 
+    # ---- 状态更新 ----
     has_abnormal = False
     for key in ['COD', 'NH3-N', 'TP', 'SS']:
         if outlet.get(key, 0) > DESIGN_LIMITS[key]['value']:
@@ -552,7 +641,15 @@ if input_data is not None:
         </div>
         """, unsafe_allow_html=True)
 
-    # ---- 进出水水质 ----
+    # ==========================================
+    # 显示微调状态
+    # ==========================================
+    if st.session_state.calibration_count > 0:
+        st.info(f"🔧 模型已微调 {st.session_state.calibration_count} 次，将根据反馈持续优化预测精度")
+
+    # ==========================================
+    # 进出水水质
+    # ==========================================
     st.markdown('<div class="section-header">📊 进出水水质实时监测</div>', unsafe_allow_html=True)
     st.caption(f"📌 出水设计标准：COD≤{DESIGN_LIMITS['COD']['value']} | NH₃-N≤{DESIGN_LIMITS['NH3-N']['value']} | TP≤{DESIGN_LIMITS['TP']['value']} | SS≤{DESIGN_LIMITS['SS']['value']} mg/L")
 
@@ -594,7 +691,110 @@ if input_data is not None:
             st.markdown(f"""<div class="metric-card"><div class="label">SS <span class="limit-ref">限值≤{DESIGN_LIMITS['SS']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if ss_ok else '#C0392B'}">{outlet['SS']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if ss_ok else f'🔴 超标{outlet["SS"]-DESIGN_LIMITS["SS"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ---- 趋势图 ----
+    # ==========================================
+    # 模型校准（会话级微调）
+    # ==========================================
+    st.markdown("---")
+    with st.expander("🔧 模型校准（输入真实出水值，让模型学习）", expanded=False):
+        st.markdown("""
+        **📖 操作说明：**
+        1. 拿到实验室或在线仪表测得的真实出水值
+        2. 在下面对应的输入框中填写真实值
+        3. 点击「校准模型」按钮
+        4. 系统会立即微调模型，后续预测会更准
+        """)
+        
+        col_cal1, col_cal2 = st.columns(2)
+        
+        with col_cal1:
+            real_cod = st.number_input("真实出水COD (mg/L)", min_value=0.0, value=0.0, step=0.1, key="real_cod")
+            real_nh3 = st.number_input("真实出水NH₃-N (mg/L)", min_value=0.0, value=0.0, step=0.01, key="real_nh3")
+        
+        with col_cal2:
+            real_tp = st.number_input("真实出水TP (mg/L)", min_value=0.0, value=0.0, step=0.001, key="real_tp")
+            real_ss = st.number_input("真实出水SS (mg/L)", min_value=0.0, value=0.0, step=0.1, key="real_ss")
+        
+        col_btn1, col_btn2 = st.columns([1, 1])
+        
+        with col_btn1:
+            if st.button("📥 校准模型", type="primary", use_container_width=True):
+                feedback_messages = []
+                calibrate_success = False
+                
+                # 获取当前特征向量
+                vec = np.array([input_data[col].values[0] if col in input_data.columns else 0 for col in feature_cols])
+                
+                # 校准 COD
+                if real_cod > 0:
+                    new_model, msg = calibrate_model('COD_out', vec, real_cod, feature_cols, scaler)
+                    feedback_messages.append(msg)
+                    if "成功" in msg:
+                        calibrate_success = True
+                        # 记录反馈日志
+                        st.session_state.feedback_log.append({
+                            'timestamp': datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                            'indicator': 'COD',
+                            'predicted': outlet['COD'],
+                            'actual': real_cod,
+                            'error': outlet['COD'] - real_cod
+                        })
+                
+                # 校准 TP
+                if real_tp > 0:
+                    new_model, msg = calibrate_model('TP_out', vec, real_tp, feature_cols, scaler)
+                    feedback_messages.append(msg)
+                    if "成功" in msg:
+                        calibrate_success = True
+                        st.session_state.feedback_log.append({
+                            'timestamp': datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                            'indicator': 'TP',
+                            'predicted': outlet['TP'],
+                            'actual': real_tp,
+                            'error': outlet['TP'] - real_tp
+                        })
+                
+                # 提示 NH3-N 和 SS 暂不支持
+                if real_nh3 > 0:
+                    feedback_messages.append("ℹ️ NH₃-N 使用对数变换模型，暂不支持实时微调")
+                if real_ss > 0:
+                    feedback_messages.append("ℹ️ SS 为模拟值，暂不支持实时微调")
+                
+                # 显示反馈结果
+                if calibrate_success:
+                    st.markdown("""
+                    <div class="calibration-success">
+                        <strong>✅ 模型校准成功！</strong><br>
+                        <span class="calibration-info">模型已根据您提供的真实值完成微调，后续预测将更准确。</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    if real_cod == 0 and real_tp == 0:
+                        st.warning("⚠️ 请至少输入一项真实出水值（COD 或 TP）才能校准模型")
+                    else:
+                        st.warning("⚠️ 模型校准失败，请检查输入的数值是否正确")
+                
+                # 显示反馈日志
+                for msg in feedback_messages:
+                    if "成功" in msg or "不支持" in msg:
+                        st.text(msg)
+        
+        with col_btn2:
+            if st.button("📊 查看反馈记录", use_container_width=True):
+                if len(st.session_state.feedback_log) > 0:
+                    df_log = pd.DataFrame(st.session_state.feedback_log)
+                    st.dataframe(df_log, use_container_width=True)
+                else:
+                    st.info("📭 暂无反馈记录")
+
+    # ==========================================
+    # 趋势图、记忆长度、时序决策、异常诊断
+    # ==========================================
+    # 这里省略趋势图、记忆长度、时序决策、异常诊断部分
+    # 与之前保持一致，完整版见最后说明
+
+    # ==========================================
+    # 简化趋势图
+    # ==========================================
     st.markdown('<div class="section-header">📈 进出水趋势（近24小时）</div>', unsafe_allow_html=True)
     times = pd.date_range(end=datetime.now(BEIJING_TZ), periods=24, freq='h')
     hist_in = {k: np.maximum(0, np.random.normal(v, v*0.12, 24)) for k, v in inlet.items()}
@@ -753,4 +953,4 @@ else:
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v5.6 | 出水标准：准Ⅳ类 | NH₃-N使用优化对数模型 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v5.7 | 出水标准：准Ⅳ类 | 会话级微调已启用 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

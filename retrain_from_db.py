@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from supabase import create_client
 
 SUPABASE_URL = "https://esoulexcrpdeeoumoili.supabase.co"
-SUPABASE_KEY = "sb_publishable_m0hz9Rv8NB_ziC5xKCltMg_Ij50d..."
+SUPABASE_KEY = "sb_publishable_m0hz9Rv8NB_ziC5xKCltMg_Ij5Od60Q"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 

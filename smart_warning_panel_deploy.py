@@ -246,7 +246,7 @@ def build_input_with_lags(cod, nh3, tp, ss, flow, pac, carbon, mlss, do):
     return data
 
 # ==========================================
-# 智能诊断引擎（完整版）
+# 智能诊断引擎（完整版，使用 f-string）
 # ==========================================
 def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
     diagnoses = []
@@ -342,7 +342,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'actions': [f'增加碳源{int(carbon)}→{int(carbon*1.25)}', f'提高DO至2.5-3.0', '加大排泥20-30%', '检查二沉池']
         })
     
-    # 出水NH3-N超标（使用优化后的预测值）
+    # 出水NH3-N超标
     if outlet['NH3-N'] > DESIGN_LIMITS['NH3-N']['value']:
         diagnoses.append({
             'level': 'critical' if outlet['NH3-N'] > 3.0 else 'warning',
@@ -370,7 +370,7 @@ def diagnose_system(inlet, outlet, pac, carbon, mlss, do):
             'level': 'warning',
             'indicator': '出水SS',
             'current': f"{outlet['SS']:.1f} mg/L",
-            'title': '⚠️ 出水SS超标（>{DESIGN_LIMITS['SS']['value']} mg/L）',
+            'title': f"⚠️ 出水SS超标（>{DESIGN_LIMITS['SS']['value']} mg/L）",
             'reasons': ['表面负荷过高', 'SVI升高', '排泥不足'],
             'actions': ['增加排泥20%', '投加PAM', '降低进水量10-15%']
         })

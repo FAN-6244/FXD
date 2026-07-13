@@ -1,6 +1,7 @@
 """
 smart_warning_panel_deploy.py
-部署到 Streamlit Cloud —— 四种输入模式 + 实测预测趋势区分 + 完整决策优化
+部署到 Streamlit Cloud —— 四种输入模式 + 永久记忆（Supabase）
+完整版 v6.0
 """
 
 import streamlit as st
@@ -12,6 +13,9 @@ from plotly.subplots import make_subplots
 import pickle
 import xgboost as xgb
 import warnings
+import os
+import supabase
+
 warnings.filterwarnings('ignore')
 
 # ==========================================
@@ -25,6 +29,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ==========================================
+# Supabase 配置
+# ==========================================
+SUPABASE_URL = "https://esoulexcrpdeeoumoili.supabase.co"
+SUPABASE_KEY = "sb_publishable_m0hz9Rv8NB_ziC5xKCltMg_Ij50d..."
+
+supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
 # CSS样式
@@ -176,9 +188,6 @@ class DataBuffer:
     def get_recent(self, hours=24):
         cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=hours)
         return [d for d in self.data if d['timestamp'] >= cutoff]
-    
-    def get_all(self):
-        return self.data
 
 # ==========================================
 # 加载预训练模型
@@ -221,12 +230,10 @@ if 'calibration_count' not in st.session_state:
     st.session_state.calibration_count = 0
 if 'auto_mode_running' not in st.session_state:
     st.session_state.auto_mode_running = False
-if 'last_input_features' not in st.session_state:
-    st.session_state.last_input_features = None
-if 'feedback_log' not in st.session_state:
-    st.session_state.feedback_log = []
 if 'simulation_counter' not in st.session_state:
     st.session_state.simulation_counter = 0
+if 'feedback_log' not in st.session_state:
+    st.session_state.feedback_log = []
 
 st.markdown('<div class="main-title">🏭 水质净化厂智能预警与调控决策系统</div>', unsafe_allow_html=True)
 
@@ -358,6 +365,47 @@ def calibrate_model(target, X_new, y_real):
         return new_model, f"✅ {target} 微调成功"
     except Exception as e:
         return None, f"❌ 失败: {str(e)}"
+
+# ==========================================
+# 永久记忆：保存数据到 Supabase
+# ==========================================
+def save_to_supabase(inlet, outlet_real, outlet_pred, source="manual"):
+    """永久保存数据到 Supabase"""
+    try:
+        data = {
+            'cod_in': inlet.get('COD', 0),
+            'nh3_in': inlet.get('NH3-N', 0),
+            'tp_in': inlet.get('TP', 0),
+            'ss_in': inlet.get('SS', 0),
+            'flow_in': inlet.get('流量', 0),
+            'pac': inlet.get('PAC', 0),
+            'carbon': inlet.get('碳源', 0),
+            'mlss': inlet.get('MLSS', 0),
+            'do_val': inlet.get('DO', 0),
+            'cod_real': outlet_real.get('COD', 0),
+            'nh3_real': outlet_real.get('NH3-N', 0),
+            'tp_real': outlet_real.get('TP', 0),
+            'ss_real': outlet_real.get('SS', 0),
+            'cod_pred': outlet_pred.get('COD', 0),
+            'nh3_pred': outlet_pred.get('NH3-N', 0),
+            'tp_pred': outlet_pred.get('TP', 0),
+            'ss_pred': outlet_pred.get('SS', 0),
+            'source': source
+        }
+        result = supabase_client.table('feedback_data').insert(data).execute()
+        return True, "数据已永久保存"
+    except Exception as e:
+        return False, f"保存失败: {str(e)}"
+
+# ==========================================
+# 获取已保存数据量
+# ==========================================
+def get_saved_count():
+    try:
+        result = supabase_client.table('feedback_data').select('*', count='exact').execute()
+        return result.count
+    except:
+        return 0
 
 # ==========================================
 # 完整诊断函数
@@ -565,18 +613,16 @@ st.sidebar.markdown("## 📊 数据输入模式")
 input_mode_global = st.sidebar.radio(
     "选择数据模式",
     ["✏️ 手动输入", "📁 文件上传", "📡 API接入", "🔄 自动实时（模拟）"],
-    index=0,
-    help="手动输入：单次预测；文件上传：批量预测；API接入：实时拉取；自动模拟：演示数据流"
+    index=0
 )
 
-# --- 定义固定的表头模板（用于文件上传校验） ---
 REQUIRED_COLS = ['COD', 'NH3-N', 'TP', 'SS', '流量', 'PAC', '碳源', 'MLSS', 'DO']
 
-# --- 初始化所有可能用到的变量（关键：防止 NameError） ---
+# --- 初始化所有变量 ---
 cod_in = nh3_in = tp_in = ss_in = flow_in = 0
 pac = carbon = mlss = do = 0
 input_data = None
-simulated_outlet = None  # 用于自动模式
+simulated_outlet = None
 
 # --- 1. 手动输入 ---
 if input_mode_global == "✏️ 手动输入":
@@ -606,7 +652,6 @@ elif input_mode_global == "📁 文件上传":
     st.sidebar.caption("请上传包含以下列的 Excel/CSV 文件：")
     st.sidebar.code("COD, NH3-N, TP, SS, 流量, PAC, 碳源, MLSS, DO", language='text')
     
-    # 提供模板下载
     if st.sidebar.button("📥 下载空模板 (Excel)"):
         template_df = pd.DataFrame(columns=REQUIRED_COLS)
         template_df.loc[0] = [200, 20, 3.0, 150, 10000, 30, 50, 4000, 2.0]
@@ -628,11 +673,9 @@ elif input_mode_global == "📁 文件上传":
                 df_upload = pd.read_csv(uploaded_file)
             else:
                 df_upload = pd.read_excel(uploaded_file)
-            
             missing_cols = set(REQUIRED_COLS) - set(df_upload.columns)
             if missing_cols:
                 st.sidebar.error(f"❌ 缺少必需列：{missing_cols}")
-                st.sidebar.info("请下载模板，按模板格式填写后重新上传。")
                 input_data = None
             else:
                 row = df_upload.iloc[0]
@@ -646,12 +689,11 @@ elif input_mode_global == "📁 文件上传":
                 mlss = row['MLSS']
                 do = row['DO']
                 input_data = build_input_with_lags(cod_in, nh3_in, tp_in, ss_in, flow_in, pac, carbon, mlss, do)
-                st.sidebar.success(f"✅ 成功加载数据 (共 {len(df_upload)} 行，使用第一行)")
+                st.sidebar.success(f"✅ 成功加载数据 (共 {len(df_upload)} 行)")
         except Exception as e:
             st.sidebar.error(f"❌ 文件解析失败：{str(e)}")
             input_data = None
     else:
-        st.sidebar.info("请上传文件")
         input_data = None
 
 # --- 3. API 接入 ---
@@ -684,13 +726,12 @@ elif input_mode_global == "📡 API接入":
             st.sidebar.error(f"❌ 连接失败：{str(e)}")
             input_data = None
     else:
-        st.sidebar.info("点击按钮获取数据")
         input_data = None
 
 # --- 4. 自动实时（模拟） ---
-else:  # input_mode_global == "🔄 自动实时（模拟）"
+else:
     st.sidebar.markdown("### 🔄 自动实时数据")
-    st.sidebar.info("🔄 每5秒自动生成一组模拟数据，模拟实时数据流")
+    st.sidebar.info("🔄 每5秒自动生成一组模拟数据")
     if st.sidebar.button("▶️ 启动实时数据流"):
         st.session_state.auto_mode_running = True
         st.sidebar.success("✅ 数据流已启动")
@@ -745,6 +786,9 @@ if input_data is not None:
                 calibrate_model('COD_out', vec, real_outlet['COD'])
             if real_outlet['TP'] > 0:
                 calibrate_model('TP_out', vec, real_outlet['TP'])
+            success, msg = save_to_supabase(inlet, real_outlet, outlet_pred, "auto")
+            if not success:
+                st.warning(f"⚠️ {msg}")
             st.session_state.feedback_log.append({
                 'timestamp': datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'),
                 'type': 'auto_calibration',
@@ -833,7 +877,7 @@ if input_data is not None:
             st.markdown(f"""<div class="metric-card"><div class="label">SS <span class="limit-ref">限值≤{DESIGN_LIMITS['SS']['value']}</span></div><div class="value" style="color:{'#1B7A4A' if ss_ok else '#C0392B'}">{outlet_display['SS']:.1f} <span style="font-size:13px;font-weight:400;color:#888;">mg/L</span></div><div class="sub">{'✅ 达标' if ss_ok else f'🔴 超标{outlet_display["SS"]-DESIGN_LIMITS["SS"]["value"]:.1f}'}</div></div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ---- 趋势图（区分进水颜色） ----
+    # ---- 趋势图 ----
     st.markdown('<div class="section-header">📈 进出水趋势（近24小时）</div>', unsafe_allow_html=True)
     st.caption("🟦 实线 = 实测值 | 虚线 = 预测值 | 🟥进水COD 🟧进水NH₃-N 🟪进水TP")
     
@@ -855,76 +899,40 @@ if input_data is not None:
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                             subplot_titles=('COD', 'NH₃-N', 'TP'))
         
-        # ----- COD 子图 -----
-        fig.add_trace(go.Scatter(
-            x=df_trend['timestamp'], y=df_trend['inlet_COD'],
-            name='进水COD', line=dict(color='#E74C3C', width=2, dash='solid'),
-            legendgroup='inlet_COD'
-        ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_trend['timestamp'], y=df_trend['inlet_COD'],
+                                name='进水COD', line=dict(color='#E74C3C', width=2, dash='solid')), row=1, col=1)
         mask_real = df_trend['outlet_COD_real'].notna()
         if mask_real.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_real]['timestamp'], 
-                y=df_trend[mask_real]['outlet_COD_real'],
-                name='出水COD_实测', line=dict(color='#2E86AB', width=2.5, dash='solid'),
-                legendgroup='outlet_COD_real'
-            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_real]['timestamp'], y=df_trend[mask_real]['outlet_COD_real'],
+                                    name='出水COD_实测', line=dict(color='#2E86AB', width=2.5, dash='solid')), row=1, col=1)
         mask_pred = df_trend['outlet_COD_pred'].notna()
         if mask_pred.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_pred]['timestamp'], 
-                y=df_trend[mask_pred]['outlet_COD_pred'],
-                name='出水COD_预测', line=dict(color='#2E86AB', width=2, dash='dot'),
-                legendgroup='outlet_COD_pred'
-            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_pred]['timestamp'], y=df_trend[mask_pred]['outlet_COD_pred'],
+                                    name='出水COD_预测', line=dict(color='#2E86AB', width=2, dash='dot')), row=1, col=1)
         fig.add_hline(y=DESIGN_LIMITS['COD']['value'], line_dash="dash", line_color="red", row=1, col=1)
         
-        # ----- NH3-N 子图 -----
-        fig.add_trace(go.Scatter(
-            x=df_trend['timestamp'], y=df_trend['inlet_NH3'],
-            name='进水NH₃-N', line=dict(color='#F39C12', width=2, dash='solid'),  # 橙色
-            legendgroup='inlet_NH3'
-        ), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_trend['timestamp'], y=df_trend['inlet_NH3'],
+                                name='进水NH₃-N', line=dict(color='#F39C12', width=2, dash='solid')), row=2, col=1)
         mask_real = df_trend['outlet_NH3_real'].notna()
         if mask_real.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_real]['timestamp'], 
-                y=df_trend[mask_real]['outlet_NH3_real'],
-                name='出水NH₃-N_实测', line=dict(color='#27AE60', width=2.5, dash='solid'),
-                legendgroup='outlet_NH3_real'
-            ), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_real]['timestamp'], y=df_trend[mask_real]['outlet_NH3_real'],
+                                    name='出水NH₃-N_实测', line=dict(color='#27AE60', width=2.5, dash='solid')), row=2, col=1)
         mask_pred = df_trend['outlet_NH3_pred'].notna()
         if mask_pred.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_pred]['timestamp'], 
-                y=df_trend[mask_pred]['outlet_NH3_pred'],
-                name='出水NH₃-N_预测', line=dict(color='#27AE60', width=2, dash='dot'),
-                legendgroup='outlet_NH3_pred'
-            ), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_pred]['timestamp'], y=df_trend[mask_pred]['outlet_NH3_pred'],
+                                    name='出水NH₃-N_预测', line=dict(color='#27AE60', width=2, dash='dot')), row=2, col=1)
         fig.add_hline(y=DESIGN_LIMITS['NH3-N']['value'], line_dash="dash", line_color="red", row=2, col=1)
         
-        # ----- TP 子图 -----
-        fig.add_trace(go.Scatter(
-            x=df_trend['timestamp'], y=df_trend['inlet_TP'],
-            name='进水TP', line=dict(color='#8E44AD', width=2, dash='solid'),  # 紫色
-            legendgroup='inlet_TP'
-        ), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_trend['timestamp'], y=df_trend['inlet_TP'],
+                                name='进水TP', line=dict(color='#8E44AD', width=2, dash='solid')), row=3, col=1)
         mask_real = df_trend['outlet_TP_real'].notna()
         if mask_real.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_real]['timestamp'], 
-                y=df_trend[mask_real]['outlet_TP_real'],
-                name='出水TP_实测', line=dict(color='#F39C12', width=2.5, dash='solid'),
-                legendgroup='outlet_TP_real'
-            ), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_real]['timestamp'], y=df_trend[mask_real]['outlet_TP_real'],
+                                    name='出水TP_实测', line=dict(color='#F39C12', width=2.5, dash='solid')), row=3, col=1)
         mask_pred = df_trend['outlet_TP_pred'].notna()
         if mask_pred.any():
-            fig.add_trace(go.Scatter(
-                x=df_trend[mask_pred]['timestamp'], 
-                y=df_trend[mask_pred]['outlet_TP_pred'],
-                name='出水TP_预测', line=dict(color='#F39C12', width=2, dash='dot'),
-                legendgroup='outlet_TP_pred'
-            ), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df_trend[mask_pred]['timestamp'], y=df_trend[mask_pred]['outlet_TP_pred'],
+                                    name='出水TP_预测', line=dict(color='#F39C12', width=2, dash='dot')), row=3, col=1)
         fig.add_hline(y=DESIGN_LIMITS['TP']['value'], line_dash="dash", line_color="red", row=3, col=1)
         
         fig.update_layout(height=450, showlegend=True, hovermode='x unified')
@@ -1044,9 +1052,20 @@ if input_data is not None:
         st.success("✅ 系统运行正常，未检测到异常")
         st.info("📋 建议：保持当前运行参数，定期巡检设备。")
 
+    # ---- 永久记忆统计 ----
+    st.markdown("---")
+    col_stats1, col_stats2, col_stats3 = st.columns(3)
+    saved_count = get_saved_count()
+    with col_stats1:
+        st.metric("📦 已永久保存数据", f"{saved_count} 组")
+    with col_stats2:
+        st.metric("🔄 模型微调次数", f"{st.session_state.calibration_count} 次")
+    with col_stats3:
+        st.metric("🧠 记忆长度共识", "COD 8h · NH₃-N 6h · TP 22h")
+
 else:
     st.info("👈 请左侧输入数据")
 
 st.markdown("---")
 beijing_now = datetime.now(BEIJING_TZ)
-st.caption(f"🏭 v5.9 + 四种输入模式 | 实测预测趋势区分 | 更新时间：{beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")
+st.caption(f"🏭 v6.0 | 四种输入模式 | 永久记忆已启用 | {beijing_now.strftime('%Y-%m-%d %H:%M')} 北京时间")

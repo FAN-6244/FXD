@@ -8,12 +8,14 @@ on:
 jobs:
   retrain:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4   # v3 → v4
+        uses: actions/checkout@v4
 
       - name: 设置 Python
-        uses: actions/setup-python@v5   # v4 → v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -25,15 +27,17 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        # 允许脚本在数据不足时正常退出，不中断工作流
-        continue-on-error: true
         run: |
           python retrain_from_db.py
+        # 即使脚本因为数据不足等正常原因退出，也视为成功
+        continue-on-error: true
 
-      - name: 提交新模型（仅当文件有变动时）
+      - name: 提交新模型
+        # 只有文件有变动时才提交
+        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add model_cache/
           git diff --staged --quiet || git commit -m "🤖 自动重训"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/FAN-6244/FXD.git
+          git push
